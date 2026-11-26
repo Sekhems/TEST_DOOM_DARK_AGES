@@ -185,6 +185,89 @@ int main() {
             subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT), str(cpp), "-o", str(exe)], check=True)
             subprocess.run([str(exe)], check=True)
 
+    def test_wait_tracing_is_pass_through_and_core_aliases_use_it(self):
+        table_start = SOURCE.index("const Entry kAlwaysTable[]")
+        table = SOURCE[table_start:SOURCE.index("};", table_start)]
+        for name in ("vkWaitSemaphores", "vkWaitSemaphoresKHR"):
+            self.assertRegex(table, rf'VKSTUB\("{name}",\s*vkWaitSemaphores\)')
+        self.assertRegex(table, r'VKSTUB\("vkDeviceWaitIdle",\s*vkDeviceWaitIdle\)')
+        for name, signature, invocation in (
+            ("vkWaitForFences", "vkWaitForFences(VkDevice device,", "real(device, fenceCount, pFences, waitAll, timeout)"),
+            ("vkWaitSemaphores", "vkWaitSemaphores(VkDevice device,", "real(device, info, timeout)"),
+            ("vkQueueWaitIdle", "vkQueueWaitIdle(VkQueue queue)", "real(queue)"),
+            ("vkDeviceWaitIdle", "vkDeviceWaitIdle(VkDevice device)", "real(device)"),
+        ):
+            body = function_body(signature)
+            self.assertIn(f'ApiCallTrace trace("{name}"', body)
+            self.assertEqual(body.count(invocation), 1)
+            self.assertIn("return r;", body)
+        newer = function_body("vkQueueSubmit2(VkQueue queue,")
+        self.assertEqual(newer.count("TraceSubmit2Begin("), 2)
+        self.assertEqual(newer.count("InFlightEnd(slot)"), 2)
+        ps = (ROOT / "build_proxy.ps1").read_text(encoding="utf-8")
+        for name in ("vkDeviceWaitIdle", "vkWaitSemaphores"):
+            self.assertIn("'" + name + "'", ps[ps.index("$localExports = @("):ps.index("$excludedExports =")])
+
+    @unittest.skipUnless(shutil.which("g++"), "requires a C++ compiler")
+    def test_wait_wrappers_forward_arguments_and_results(self):
+        prelude = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+using VkResult = int; using VkDevice = void*; using VkQueue = void*; using VkFence = void*;
+using VkSemaphore = void*; using VkBool32 = unsigned; using LONG = long;
+constexpr int VK_SUCCESS=0, VK_TIMEOUT=2, VK_ERROR_INITIALIZATION_FAILED=-3;
+constexpr VkFence VK_NULL_HANDLE=nullptr;
+constexpr int _TRUNCATE=0;
+struct VkSemaphoreWaitInfo { uint32_t flags, semaphoreCount; const VkSemaphore* pSemaphores; const uint64_t* pValues; };
+using PFN_vkWaitForFences = VkResult(*)(VkDevice,uint32_t,const VkFence*,VkBool32,uint64_t);
+using PFN_vkQueueWaitIdle = VkResult(*)(VkQueue);
+using PFN_vkDeviceWaitIdle = VkResult(*)(VkDevice);
+using PFN_vkWaitSemaphores = VkResult(*)(VkDevice,const VkSemaphoreWaitInfo*,uint64_t);
+VkDevice dev=(void*)0x100; VkQueue queue=(void*)0x200; VkFence fence=(void*)0x300;
+VkSemaphore sem=(void*)0x400; uint64_t value=7; VkSemaphoreWaitInfo wi{0,1,&sem,&value};
+int calls=0, traced=0, activeTrace=0; uint64_t expectedTimeout=0;
+volatile LONG g_fenceTimeouts=0, g_semaphoreTimeouts=0;
+VkResult waitFence(VkDevice d,uint32_t n,const VkFence* p,VkBool32 all,uint64_t t) {
+ assert(d==dev && n==1 && *p==fence && all==1 && t==expectedTimeout); calls++; return VK_TIMEOUT; }
+VkResult waitQueue(VkQueue q) { assert(q==queue); calls++; return 0; }
+VkResult waitDevice(VkDevice d) { assert(d==dev); calls++; return 0; }
+VkResult waitSem(VkDevice d,const VkSemaphoreWaitInfo* i,uint64_t t) {
+ assert(d==dev && i==&wi && t==expectedTimeout); calls++; return VK_TIMEOUT; }
+template<typename T> T RealExport(const char* name) {
+ if (!strcmp(name,"vkWaitForFences")) return reinterpret_cast<T>(reinterpret_cast<void*>(&waitFence));
+ if (!strcmp(name,"vkQueueWaitIdle")) return reinterpret_cast<T>(reinterpret_cast<void*>(&waitQueue));
+ if (!strcmp(name,"vkDeviceWaitIdle")) return reinterpret_cast<T>(reinterpret_cast<void*>(&waitDevice));
+ if (!strcmp(name,"vkWaitSemaphores")) return reinterpret_cast<T>(reinterpret_cast<void*>(&waitSem));
+ return nullptr;
+}
+struct ApiCallTrace { ApiCallTrace(const char*, const char*, bool enabled=true) { traced++; if(enabled) activeTrace++; } };
+template<typename... A> int _snprintf_s(char*,size_t,int,const char*, A...) { return 0; }
+LONG InterlockedIncrement(volatile LONG* p) { return ++*p; }
+void LogLine(const char*,...) {}
+'''
+        wrappers = "\n".join("VkResult " + function_body(signature) for signature in (
+            "vkQueueWaitIdle(VkQueue queue)", "vkDeviceWaitIdle(VkDevice device)",
+            "vkWaitForFences(VkDevice device,", "vkWaitSemaphores(VkDevice device,"))
+        main = r'''
+int main() {
+ expectedTimeout=123; assert(vkWaitForFences(dev,1,&fence,1,expectedTimeout)==VK_TIMEOUT);
+ assert(vkWaitSemaphores(dev,&wi,expectedTimeout)==VK_TIMEOUT);
+ expectedTimeout=0; assert(vkWaitForFences(dev,1,&fence,1,0)==VK_TIMEOUT);
+ assert(vkWaitSemaphores(dev,&wi,0)==VK_TIMEOUT);
+ assert(vkQueueWaitIdle(queue)==VK_SUCCESS && vkDeviceWaitIdle(dev)==VK_SUCCESS);
+ assert(calls==6 && traced==6 && activeTrace==4);
+ assert(g_fenceTimeouts==2 && g_semaphoreTimeouts==2);
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            cpp = pathlib.Path(tmp) / "test.cpp"
+            exe = pathlib.Path(tmp) / "test"
+            cpp.write_text(prelude + wrappers + main)
+            subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(exe)], check=True)
+            subprocess.run([str(exe)], check=True)
+
     def test_submit_counters_cover_both_paths(self):
         normal = function_body("vkQueueSubmit(VkQueue queue,")
         newer = function_body("vkQueueSubmit2(VkQueue queue,")

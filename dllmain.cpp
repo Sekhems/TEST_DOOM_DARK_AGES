@@ -133,6 +133,8 @@ vkFreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count,
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue);
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo*, uint64_t);
 
 extern "C" VKAPI_ATTR void VKAPI_CALL
 vkGetDeviceBufferMemoryRequirements(VkDevice device,
@@ -213,6 +215,8 @@ volatile LONG g_presentCount = 0;
 volatile LONG g_submitCount = 0;
 volatile LONG g_lastPresentRes = 0;
 volatile LONG g_lastSubmitRes = 0;
+volatile LONG g_fenceTimeouts = 0;
+volatile LONG g_semaphoreTimeouts = 0;
 volatile LONG64 g_lastPresentTick = 0;
 volatile LONG64 g_lastSubmitTick = 0;
 
@@ -954,6 +958,8 @@ volatile LONG64 g_lastSubmitTick = 0;
 // v4: sync2 -> sync1 translation helpers
 // ---------------------------------------------------------------------------
 namespace {
+    int TraceSubmit2Begin(VkQueue queue, uint32_t count, VkFence fence);
+    void InFlightEnd(int slot);
     VkPipelineStageFlags ConvertStage2(VkPipelineStageFlags2 s2) {
     if (s2 == 0) return 0;
     constexpr VkPipelineStageFlags kKnown =
@@ -1009,7 +1015,9 @@ vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmit
     auto real = RealExport<PFN_vkQueueSubmit>("vkQueueSubmit");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     if (submitCount == 0 || !pSubmits) {
+        const int slot = TraceSubmit2Begin(queue, 0, fence);
         VkResult sr = real(queue, 0, nullptr, fence);
+        InFlightEnd(slot);
         InterlockedIncrement(&g_submitCount);
         InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(sr));
         InterlockedExchange64(&g_lastSubmitTick, static_cast<LONG64>(GetTickCount64()));
@@ -1067,7 +1075,9 @@ vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmit
         si[i].pSignalSemaphores = sigSem[i].empty() ? nullptr : sigSem[i].data();
     }
     if (FirstTime("sync2:queueSubmit2")) LogLine("SYNC2: vkQueueSubmit2 -> vkQueueSubmit (+timeline values)");
+    const int slot = TraceSubmit2Begin(queue, submitCount, fence);
     const VkResult sr = real(queue, submitCount, si.data(), fence);
+    InFlightEnd(slot);
     // [v3.2] a lost device / failed submit used to be invisible in the log
     InterlockedIncrement(&g_submitCount);
     InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(sr));
@@ -3847,6 +3857,27 @@ if (si.rewritten) return std::string();
         return -1;
     }
     void InFlightEnd(int i) { if (i >= 0 && i < kInFlightMax) InterlockedExchange(&g_inflight[i].state, 0); }
+    int TraceSubmit2Begin(VkQueue queue, uint32_t count, VkFence fence) {
+        if (g_spvCfgLoaded != 2 || !g_spvCfg.watchdog) return -1;
+        char job[160];
+        _snprintf_s(job, sizeof(job), _TRUNCATE, "API-WAIT vkQueueSubmit2 queue=%p batches=%u fence=%p", (void*)queue, count, (void*)fence);
+        return InFlightBegin(job);
+    }
+
+    // Observe blocking API calls without modifying their timeouts, return values or synchronization.
+    // The watchdog can report them while the game thread is still inside the driver.
+    struct ApiCallTrace {
+        int slot = -1;
+        explicit ApiCallTrace(const char* name, const char* detail = "", bool enabled = true) {
+            if (!enabled || g_spvCfgLoaded != 2 || !g_spvCfg.watchdog) return;
+            char job[240];
+            _snprintf_s(job, sizeof(job), _TRUNCATE, "API-WAIT %s %s", name, detail);
+            slot = InFlightBegin(job);
+        }
+        ~ApiCallTrace() { InFlightEnd(slot); }
+        ApiCallTrace(const ApiCallTrace&) = delete;
+        ApiCallTrace& operator=(const ApiCallTrace&) = delete;
+    };
 
     void DumpAllThreads(const char* why);   // [v3.2] defined after ModuleOffset()
     DWORD WINAPI WatchdogProc(LPVOID) {
@@ -3884,6 +3915,8 @@ if (si.rewritten) return std::string();
                     static_cast<long>(p), static_cast<long>(p - prevPresents), static_cast<long>(sb), static_cast<long>(sb - prevSubmits),
                     static_cast<long>(g_lastPresentRes), static_cast<long>(g_lastSubmitRes),
                     static_cast<unsigned long long>(lp ? (now - lp) / 1000 : 0));
+                LogLine("WAIT-STATS: fenceTimeouts=%ld semaphoreTimeouts=%ld (includes normal nonblocking polls)",
+                    static_cast<long>(g_fenceTimeouts), static_cast<long>(g_semaphoreTimeouts));
                 prevPresents = p; prevSubmits = sb;
             }
             // [v3.2] stall detector: the game stopped presenting -> show where every thread is waiting.
@@ -5318,6 +5351,9 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
 
     LoadSpvConfig();
+    char presentDetail[96];
+    _snprintf_s(presentDetail, sizeof(presentDetail), _TRUNCATE, "queue=%p", (void*)queue);
+    ApiCallTrace trace("vkQueuePresentKHR", presentDetail);
     VkPresentInfoKHR modifiedPresent{};
     const VkPresentInfoKHR* usePresent = pPresentInfo;
     VkSemaphore postSem = VK_NULL_HANDLE;
@@ -6097,7 +6133,10 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
         const Entry kAlwaysTable[] = {
             VKSTUB("vkQueueSubmit", vkQueueSubmit),
             VKSTUB("vkQueueWaitIdle", vkQueueWaitIdle),
+            VKSTUB("vkDeviceWaitIdle", vkDeviceWaitIdle),
             VKSTUB("vkWaitForFences", vkWaitForFences),
+            VKSTUB("vkWaitSemaphores", vkWaitSemaphores),
+            VKSTUB("vkWaitSemaphoresKHR", vkWaitSemaphores),
             VKSTUB("vkCreateGraphicsPipelines", vkCreateGraphicsPipelines),
 			VKSTUB("vkCreateComputePipelines",  vkCreateComputePipelines),
             VKSTUB("vkDestroyPipeline",         vkDestroyPipeline),
@@ -6696,6 +6735,9 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
     auto real = RealExport<PFN_vkQueueSubmit>("vkQueueSubmit");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[128];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "queue=%p batches=%u fence=%p", (void*)queue, submitCount, (void*)fence);
+    ApiCallTrace trace("vkQueueSubmit", detail);
     VkResult r = real(queue, submitCount, pSubmits, fence);
     InterlockedIncrement(&g_submitCount);
     InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(r));
@@ -6707,6 +6749,9 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueWaitIdle(VkQueue queue) {
     auto real = RealExport<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[96];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "queue=%p", (void*)queue);
+    ApiCallTrace trace("vkQueueWaitIdle", detail);
     VkResult r = real(queue);
     if (r != VK_SUCCESS) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkQueueWaitIdle FAILED: result=%d", (int)r); }
     return r;
@@ -6715,8 +6760,41 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout) {
     auto real = RealExport<PFN_vkWaitForFences>("vkWaitForFences");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[160];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p all=%u timeout_ns=%llu",
+        (void*)device, fenceCount, (void*)(fenceCount && pFences ? pFences[0] : VK_NULL_HANDLE), (unsigned)waitAll,
+        (unsigned long long)timeout);
+    ApiCallTrace trace("vkWaitForFences", detail, timeout != 0);
     VkResult r = real(device, fenceCount, pFences, waitAll, timeout);
+    if (r == VK_TIMEOUT) InterlockedIncrement(&g_fenceTimeouts);
     if (r != VK_SUCCESS && r != VK_TIMEOUT) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkWaitForFences FAILED: result=%d", (int)r); }
+    return r;
+}
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL
+vkDeviceWaitIdle(VkDevice device) {
+    auto real = RealExport<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[96];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p", (void*)device);
+    ApiCallTrace trace("vkDeviceWaitIdle", detail);
+    VkResult r = real(device);
+    if (r != VK_SUCCESS) LogLine("vkDeviceWaitIdle FAILED: result=%d", (int)r);
+    return r;
+}
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL
+vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+    auto real = RealExport<PFN_vkWaitSemaphores>("vkWaitSemaphores");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[160];
+    const bool first = info && info->semaphoreCount && info->pSemaphores && info->pValues;
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p value=%llu flags=0x%X timeout_ns=%llu",
+        (void*)device, info ? info->semaphoreCount : 0, (void*)(first ? info->pSemaphores[0] : VK_NULL_HANDLE),
+        first ? (unsigned long long)info->pValues[0] : 0ull, info ? (unsigned)info->flags : 0,
+        (unsigned long long)timeout);
+    ApiCallTrace trace("vkWaitSemaphores", detail, timeout != 0);
+    VkResult r = real(device, info, timeout);
+    if (r == VK_TIMEOUT) InterlockedIncrement(&g_semaphoreTimeouts);
+    if (r != VK_SUCCESS && r != VK_TIMEOUT) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkWaitSemaphores FAILED: result=%d", (int)r); }
     return r;
 }
 
@@ -7580,6 +7658,8 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
     }
     // [SWRT] BVH builder kernels need 64-bit ints, buffer device address and scalar block layout.
     LoadSpvConfig();
+    if (g_spvCfg.watchdog)
+        LogLine("API-WAIT: watchdog tracking active for submit, present, fence, semaphore and idle calls");
     if (g_spvCfg.recoverMissingASCalls)
         LogLine("AS recovery: experimental null-call redirect enabled");
     if (g_spvCfg.softwareRT && g_spvCfg.swrtForceFeatures) {
