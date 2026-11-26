@@ -331,6 +331,14 @@ int main() {
  VkSubmitInfo huge{nullptr,0,0,70,nullptr,nullptr,many};
  SemaphoreTraceSignals(queue,fence,1,&huge,-4);
  assert(g_semaphoreSignalSequence==65 && g_semaphoreSignals[64].result==-4);
+ VkSubmitInfo noSignal{&tl,5,2,0,waits,stages,nullptr};
+ SemaphoreTraceSignals(queue,nullptr,1,&noSignal,0);
+ assert(g_semaphoreSignalSequence==66 && g_semaphoreSignals[65].semaphore==0);
+ assert(g_semaphoreSignals[65].waits==2 && g_semaphoreSignals[65].signals==0 && g_semaphoreSignals[65].wait[0].value==7);
+ logs.clear(); DumpRecentSubmitDependencies();
+ assert(logs.find("SUBMIT-RECENT entries=48")!=std::string::npos);
+ assert(logs.find("cmds=5 waits=2 signals=0")!=std::string::npos && logs.find("wait[1]")!=std::string::npos);
+ assert(logs.find("not GPU completion")!=std::string::npos);
  auto other=reinterpret_cast<void*>(0x999);
  for (unsigned i=0;i<8192;++i) FenceTraceLife(nullptr,other,2,0);
  logs.clear(); DumpFenceHistory(fence);
@@ -348,7 +356,7 @@ int main() {
  assert(logs.find("not proof of cause")!=std::string::npos);
  auto before=g_fenceHistorySequence; g_spvCfg.watchdog=0; FenceTraceLife(nullptr,fence,1,0);
  SampleFencePoll(nullptr,fence,2); SemaphoreTraceSignals(queue,nullptr,1,submits,0);
- assert(g_fenceHistorySequence==before && g_fencePollSequence==2 && g_semaphoreSignalSequence==65);
+ assert(g_fenceHistorySequence==before && g_fencePollSequence==2 && g_semaphoreSignalSequence==66);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,6 +387,7 @@ int main() {
         self.assertLess(wait.index("real(device, fenceCount, pFences, waitAll, timeout)"), wait.index("SampleFencePoll("))
         watchdog = function_body("DWORD WINAPI WatchdogProc(")
         self.assertIn("DumpFencePollSamples(now)", watchdog)
+        self.assertIn("DumpRecentSubmitDependencies()", watchdog)
 
     @unittest.skipUnless(shutil.which("g++"), "requires a C++ compiler")
     def test_fence_lifecycle_wrappers_forward_driver_results(self):

@@ -3921,11 +3921,11 @@ if (si.rewritten) return std::string();
         }
     }
 
-    // Best-effort CPU-side record of submitted semaphore signals, including submits
-    // without fences. Neither a successful submit nor a recorded signal means GPU completion.
+    // Best-effort CPU-side records of submit batches, including those without a
+    // fence or semaphore signal. A successful submit does not mean GPU completion.
     struct SemaphoreSignalEvent {
         ULONGLONG tick; DWORD tid; uintptr_t semaphore, queue, fence;
-        int result; uint32_t batch, commands, waits, captured; bool hasValue; uint64_t value;
+        int result; uint32_t batch, commands, waits, signals, captured; bool hasValue; uint64_t value;
         FenceWaitInfo wait[4];
     };
     constexpr size_t kSemaphoreSignalHistorySize = 32768;
@@ -3937,7 +3937,6 @@ if (si.rewritten) return std::string();
         unsigned recorded = 0;
         for (uint32_t i = 0; i < count && recorded < 64; ++i) {
             const VkSubmitInfo& s = submits[i];
-            if (!s.signalSemaphoreCount || !s.pSignalSemaphores) continue;
             const VkTimelineSemaphoreSubmitInfo* timeline = nullptr;
             auto p = reinterpret_cast<const VkBaseInStructure*>(s.pNext);
             for (unsigned steps = 0; p && steps < 32; ++steps, p = p->pNext) {
@@ -3948,7 +3947,7 @@ if (si.rewritten) return std::string();
             SemaphoreSignalEvent base{};
             base.tick = GetTickCount64(); base.tid = GetCurrentThreadId(); base.queue = (uintptr_t)queue;
             base.fence = (uintptr_t)fence; base.result = (int)result; base.batch = i;
-            base.commands = s.commandBufferCount; base.waits = s.waitSemaphoreCount;
+            base.commands = s.commandBufferCount; base.waits = s.waitSemaphoreCount; base.signals = s.signalSemaphoreCount;
             for (uint32_t j = 0; j < s.waitSemaphoreCount && base.captured < 4 && s.pWaitSemaphores; ++j) {
                 FenceWaitInfo& w = base.wait[base.captured++];
                 w.semaphore = (uintptr_t)s.pWaitSemaphores[j];
@@ -3957,7 +3956,11 @@ if (si.rewritten) return std::string();
                 w.value = w.hasValue ? timeline->pWaitSemaphoreValues[j] : 0;
             }
             AcquireSRWLockExclusive(&g_semaphoreSignalLock);
-            for (uint32_t j = 0; j < s.signalSemaphoreCount && recorded < 64; ++j, ++recorded) {
+            if (!s.signalSemaphoreCount || !s.pSignalSemaphores) {
+                g_semaphoreSignals[g_semaphoreSignalSequence++ % kSemaphoreSignalHistorySize] = base;
+                ++recorded;
+            }
+            for (uint32_t j = 0; s.pSignalSemaphores && j < s.signalSemaphoreCount && recorded < 64; ++j, ++recorded) {
                 SemaphoreSignalEvent e = base; e.semaphore = (uintptr_t)s.pSignalSemaphores[j];
                 e.hasValue = timeline && timeline->pSignalSemaphoreValues && j < timeline->signalSemaphoreValueCount;
                 e.value = e.hasValue ? timeline->pSignalSemaphoreValues[j] : 0;
@@ -3985,6 +3988,27 @@ if (si.rewritten) return std::string();
                 e.batch, e.commands, e.waits, e.captured, (unsigned)e.hasValue, (unsigned long long)e.value);
             for (uint32_t j = 0; j < e.captured; ++j)
                 LogLine("SEMAPHORE-SIGNALS wait[%u] semaphore=%p stage=0x%X submit_has_value=%u value=%llu",
+                    j, (void*)e.wait[j].semaphore, (unsigned)e.wait[j].stage, (unsigned)e.wait[j].hasValue,
+                    (unsigned long long)e.wait[j].value);
+        }
+    }
+    void DumpRecentSubmitDependencies() {
+        SemaphoreSignalEvent found[48]{}; unsigned n = 0; uint64_t seq;
+        AcquireSRWLockShared(&g_semaphoreSignalLock);
+        seq = g_semaphoreSignalSequence;
+        for (uint64_t i = 0; i < 48 && i < seq; ++i)
+            found[n++] = g_semaphoreSignals[(seq - 1 - i) % kSemaphoreSignalHistorySize];
+        ReleaseSRWLockShared(&g_semaphoreSignalLock);
+        LogLine("SUBMIT-RECENT entries=%u globalEvents=%llu (CPU return order; up to 64 records per call; incomplete; not GPU completion)",
+            n, (unsigned long long)seq);
+        while (n) {
+            const auto& e = found[--n];
+            LogLine("SUBMIT-RECENT tick=%llu thread=%lu queue=%p fence=%p result=%d batch=%u cmds=%u waits=%u signals=%u signal=%p submit_has_value=%u value=%llu captured_waits=%u",
+                (unsigned long long)e.tick, (unsigned long)e.tid, (void*)e.queue, (void*)e.fence,
+                e.result, e.batch, e.commands, e.waits, e.signals, (void*)e.semaphore,
+                (unsigned)e.hasValue, (unsigned long long)e.value, e.captured);
+            for (uint32_t j = 0; j < e.captured; ++j)
+                LogLine("SUBMIT-RECENT wait[%u] semaphore=%p stage=0x%X submit_has_value=%u value=%llu",
                     j, (void*)e.wait[j].semaphore, (unsigned)e.wait[j].stage, (unsigned)e.wait[j].hasValue,
                     (unsigned long long)e.wait[j].value);
         }
@@ -4141,6 +4165,7 @@ if (si.rewritten) return std::string();
                         static_cast<unsigned long long>((now - lp) / 1000), static_cast<long>(g_presentCount),
                         static_cast<long>(g_submitCount), static_cast<long>(g_lastPresentRes), static_cast<long>(g_lastSubmitRes));
                     DumpFencePollSamples(now);
+                    DumpRecentSubmitDependencies();
                     DumpAllThreads(why);
                 }
             }
