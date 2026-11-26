@@ -3919,6 +3919,46 @@ if (si.rewritten) return std::string();
         }
     }
 
+    // Sample zero-timeout, single-fence polls without logging on the hot path. This
+    // is a bounded clue, not proof the last sampled fence caused the later stall.
+    struct FencePollSample { ULONGLONG tick; DWORD tid; uintptr_t device, fence; int result; };
+    constexpr size_t kFencePollSamples = 128;
+    FencePollSample g_fencePollSamples[kFencePollSamples]{};
+    SRWLOCK g_fencePollLock = SRWLOCK_INIT;
+    uint64_t g_fencePollSequence = 0;
+    void SampleFencePoll(VkDevice device, VkFence fence, VkResult result) {
+        if (!fence || !FenceTraceEnabled()) return;
+        // Each thread samples its first poll and then one in 4096, regardless of result.
+        static thread_local uint32_t count = 0;
+        if ((count++ & 4095u) != 0) return;
+        FencePollSample e{GetTickCount64(), GetCurrentThreadId(), (uintptr_t)device, (uintptr_t)fence, (int)result};
+        AcquireSRWLockExclusive(&g_fencePollLock);
+        g_fencePollSamples[g_fencePollSequence++ % kFencePollSamples] = e;
+        ReleaseSRWLockExclusive(&g_fencePollLock);
+    }
+    void DumpFencePollSamples(ULONGLONG now) {
+        FencePollSample found[8]{}; size_t n = 0; uint64_t seq = 0;
+        AcquireSRWLockShared(&g_fencePollLock);
+        seq = g_fencePollSequence;
+        for (uint64_t i = 0; i < kFencePollSamples && i < seq && n < 8; ++i) {
+            const FencePollSample& e = g_fencePollSamples[(seq - 1 - i) % kFencePollSamples];
+            bool duplicate = false;
+            for (size_t j = 0; j < n; ++j)
+                if (found[j].tid == e.tid && found[j].device == e.device && found[j].fence == e.fence) duplicate = true;
+            if (!duplicate) found[n++] = e;
+        }
+        ReleaseSRWLockShared(&g_fencePollLock);
+        LogLine("FENCE-POLL sampled zero-timeout single-fence calls: entries=%u samples=%llu (1 per 4096 per thread; stale/incomplete; not proof of cause)",
+            (unsigned)n, (unsigned long long)seq);
+        for (size_t i = 0; i < n; ++i) {
+            const FencePollSample& e = found[i];
+            LogLine("FENCE-POLL tick=%llu age_ms=%llu thread=%lu device=%p fence=%p result=%d",
+                (unsigned long long)e.tick, (unsigned long long)(now >= e.tick ? now - e.tick : 0),
+                (unsigned long)e.tid, (void*)e.device, (void*)e.fence, e.result);
+            DumpFenceHistory((VkFence)e.fence);
+        }
+    }
+
     struct InFlight { volatile LONG state; volatile LONG abandoned; DWORD tid; ULONGLONG t0; ULONGLONG lastWarn; VkFence waitFence; char job[240]; };
     constexpr int kInFlightMax = 256;
     InFlight g_inflight[kInFlightMax];
@@ -4016,6 +4056,7 @@ if (si.rewritten) return std::string();
                     sprintf_s(why, sizeof(why), "no vkQueuePresentKHR for %llu s (presents=%ld submits=%ld lastPresentResult=%ld lastSubmitResult=%ld)",
                         static_cast<unsigned long long>((now - lp) / 1000), static_cast<long>(g_presentCount),
                         static_cast<long>(g_submitCount), static_cast<long>(g_lastPresentRes), static_cast<long>(g_lastSubmitRes));
+                    DumpFencePollSamples(now);
                     DumpAllThreads(why);
                 }
             }
@@ -6878,6 +6919,7 @@ vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences, Vk
                        timeout != 0 && fenceCount == 1 && pFences ? pFences[0] : VK_NULL_HANDLE);
     VkResult r = real(device, fenceCount, pFences, waitAll, timeout);
     if (r == VK_TIMEOUT) InterlockedIncrement(&g_fenceTimeouts);
+    if (timeout == 0 && fenceCount == 1 && pFences) SampleFencePoll(device, pFences[0], r);
     if (r != VK_SUCCESS && r != VK_TIMEOUT) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkWaitForFences FAILED: result=%d", (int)r); }
     return r;
 }

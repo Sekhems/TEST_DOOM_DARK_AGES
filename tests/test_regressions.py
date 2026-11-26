@@ -227,7 +227,7 @@ using PFN_vkDeviceWaitIdle = VkResult(*)(VkDevice);
 using PFN_vkWaitSemaphores = VkResult(*)(VkDevice,const VkSemaphoreWaitInfo*,uint64_t);
 VkDevice dev=(void*)0x100; VkQueue queue=(void*)0x200; VkFence fence=(void*)0x300;
 VkSemaphore sem=(void*)0x400; uint64_t value=7; VkSemaphoreWaitInfo wi{0,1,&sem,&value};
-int calls=0, traced=0, activeTrace=0; uint64_t expectedTimeout=0;
+int calls=0, traced=0, activeTrace=0, sampled=0; uint64_t expectedTimeout=0;
 volatile LONG g_fenceTimeouts=0, g_semaphoreTimeouts=0;
 VkResult waitFence(VkDevice d,uint32_t n,const VkFence* p,VkBool32 all,uint64_t t) {
  assert(d==dev && n==1 && *p==fence && all==1 && t==expectedTimeout); calls++; return VK_TIMEOUT; }
@@ -243,6 +243,7 @@ template<typename T> T RealExport(const char* name) {
  return nullptr;
 }
 struct ApiCallTrace { ApiCallTrace(const char*, const char*, bool enabled=true, VkFence=nullptr) { traced++; if(enabled) activeTrace++; } };
+void SampleFencePoll(VkDevice d, VkFence f, VkResult r) { assert(d==dev && f==fence && r==VK_TIMEOUT); sampled++; }
 template<typename... A> int _snprintf_s(char*,size_t,int,const char*, A...) { return 0; }
 LONG InterlockedIncrement(volatile LONG* p) { return ++*p; }
 void LogLine(const char*,...) {}
@@ -257,7 +258,7 @@ int main() {
  expectedTimeout=0; assert(vkWaitForFences(dev,1,&fence,1,0)==VK_TIMEOUT);
  assert(vkWaitSemaphores(dev,&wi,0)==VK_TIMEOUT);
  assert(vkQueueWaitIdle(queue)==VK_SUCCESS && vkDeviceWaitIdle(dev)==VK_SUCCESS);
- assert(calls==6 && traced==6 && activeTrace==4);
+ assert(calls==6 && traced==6 && activeTrace==4 && sampled==1);
  assert(g_fenceTimeouts==2 && g_semaphoreTimeouts==2);
 }
 '''
@@ -319,8 +320,20 @@ int main() {
  for (unsigned i=0;i<8192;++i) FenceTraceLife(nullptr,other,2,0);
  logs.clear(); DumpFenceHistory(fence);
  assert(logs.find("entries=0")!=std::string::npos && logs.find("older events may be overwritten")!=std::string::npos);
+ // First poll is sampled, subsequent 4095 are not; the 4097th is sampled.
+ SampleFencePoll(nullptr,fence,2);
+ assert(g_fencePollSequence==1 && g_fencePollSamples[0].result==2);
+ for (unsigned i=0;i<4095;++i) SampleFencePoll(nullptr,fence,2);
+ assert(g_fencePollSequence==1);
+ SampleFencePoll(nullptr,fence,0);
+ assert(g_fencePollSequence==2 && g_fencePollSamples[1].result==0);
+ logs.clear(); DumpFencePollSamples(223);
+ assert(logs.find("entries=1 samples=2")!=std::string::npos);
+ assert(logs.find("age_ms=100")!=std::string::npos && logs.find("result=0")!=std::string::npos);
+ assert(logs.find("not proof of cause")!=std::string::npos);
  auto before=g_fenceHistorySequence; g_spvCfg.watchdog=0; FenceTraceLife(nullptr,fence,1,0);
- assert(g_fenceHistorySequence==before);
+ SampleFencePoll(nullptr,fence,2);
+ assert(g_fenceHistorySequence==before && g_fencePollSequence==2);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,6 +358,10 @@ int main() {
         wait = function_body("vkWaitForFences(VkDevice device,")
         self.assertIn("fenceCount == 1 && pFences ? pFences[0]", wait)
         self.assertIn("real(device, fenceCount, pFences, waitAll, timeout)", wait)
+        self.assertIn("timeout == 0 && fenceCount == 1 && pFences", wait)
+        self.assertLess(wait.index("real(device, fenceCount, pFences, waitAll, timeout)"), wait.index("SampleFencePoll("))
+        watchdog = function_body("DWORD WINAPI WatchdogProc(")
+        self.assertIn("DumpFencePollSamples(now)", watchdog)
 
     @unittest.skipUnless(shutil.which("g++"), "requires a C++ compiler")
     def test_fence_lifecycle_wrappers_forward_driver_results(self):
