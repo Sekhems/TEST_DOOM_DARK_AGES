@@ -129,6 +129,10 @@ extern "C" VKAPI_ATTR void VKAPI_CALL
 vkFreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count,
     const VkCommandBuffer* pBuffers);
 
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
+
 extern "C" VKAPI_ATTR void VKAPI_CALL
 vkGetDeviceBufferMemoryRequirements(VkDevice device,
     const VkDeviceBufferMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements);
@@ -1003,7 +1007,14 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
     auto real = RealExport<PFN_vkQueueSubmit>("vkQueueSubmit");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
-    if (submitCount == 0 || !pSubmits) return real(queue, 0, nullptr, fence);
+    if (submitCount == 0 || !pSubmits) {
+        VkResult sr = real(queue, 0, nullptr, fence);
+        InterlockedIncrement(&g_submitCount);
+        InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(sr));
+        InterlockedExchange64(&g_lastSubmitTick, static_cast<LONG64>(GetTickCount64()));
+        if (sr != VK_SUCCESS) LogLine("vkQueueSubmit2 (empty) FAILED: result=%d", (int)sr);
+        return sr;
+    }
 
     std::vector<VkSubmitInfo> si(submitCount);
     // [FIX] The old translation dropped VkSemaphoreSubmitInfo::value. Timeline semaphores then never reached the
@@ -5503,25 +5514,32 @@ vkBindImageMemory2(VkDevice device, uint32_t bindCount, const VkBindImageMemoryI
     return r;
 }
 
+// Use the same effective usage flags for actual creation and maintenance4 queries.
+static bool PatchSwrtBufferCreateInfo(const VkBufferCreateInfo& source, VkBufferCreateInfo& patched) {
+    constexpr VkBufferUsageFlags kRtBits = 0x00080000 | 0x00100000 | 0x00000400;
+    LoadSpvConfig();
+    if (!g_spvCfg.softwareRT || !g_spvCfg.swrtPatchBuffers || !swpx::Ready() || !(source.usage & kRtBits)) return false;
+    patched = source;
+    patched.usage = (source.usage & ~kRtBits) | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    return true;
+}
+
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pInfo,
     const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer) {
     auto real = RealExport<PFN_vkCreateBuffer>("vkCreateBuffer");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
-    // [SWRT] Strip RT-only usage bits the driver does not know; AS / SBT / build-input buffers become plain device-address
-    // storage buffers (our BVH builder reads and writes them from compute shaders through their device address).
     VkBufferCreateInfo patched{};
-    if (pInfo) {
-        constexpr VkBufferUsageFlags kRtBits = 0x00080000 /*AS_BUILD_INPUT_READ_ONLY*/ | 0x00100000 /*AS_STORAGE*/ | 0x00000400 /*SHADER_BINDING_TABLE*/;
-        LoadSpvConfig();
-        if (g_spvCfg.softwareRT && g_spvCfg.swrtPatchBuffers && swpx::Ready() && (pInfo->usage & kRtBits)) {
-            patched = *pInfo;
-            patched.usage = (pInfo->usage & ~kRtBits) | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            static volatile LONG n = 0;
-            if (InterlockedIncrement(&n) <= 8) LogLine("SWRT: vkCreateBuffer RT usage 0x%X -> 0x%X (size=%llu)", (unsigned)pInfo->usage, (unsigned)patched.usage, (unsigned long long)pInfo->size);
-            pInfo = &patched;
-        }
+    if (pInfo && PatchSwrtBufferCreateInfo(*pInfo, patched)) {
+        static volatile LONG n = 0;
+        if (InterlockedIncrement(&n) <= 8) LogLine("SWRT: vkCreateBuffer RT usage 0x%X -> 0x%X (size=%llu)", (unsigned)pInfo->usage, (unsigned)patched.usage, (unsigned long long)pInfo->size);
+        pInfo = &patched;
+    }
+    if (pInfo && pInfo->size == 0) {
+        static volatile LONG zeroCount = 0;
+        if (InterlockedIncrement(&zeroCount) <= 20)
+            LogLine("!!! vkCreateBuffer called with size=0, usage=0x%X (invalid Vulkan create info; check preceding EXEC@0)", (unsigned)pInfo->usage);
     }
     VkResult r = real(device, pInfo, pAllocator, pBuffer);
     if (r != VK_SUCCESS) {
@@ -5948,6 +5966,9 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
         // Always-active: dynamic rendering emulation, memory-requirements stubs,
         // and the pipeline bind/destroy hooks (which used to be RT-only).
         const Entry kAlwaysTable[] = {
+            VKSTUB("vkQueueSubmit", vkQueueSubmit),
+            VKSTUB("vkQueueWaitIdle", vkQueueWaitIdle),
+            VKSTUB("vkWaitForFences", vkWaitForFences),
             VKSTUB("vkCreateGraphicsPipelines", vkCreateGraphicsPipelines),
 			VKSTUB("vkCreateComputePipelines",  vkCreateComputePipelines),
             VKSTUB("vkDestroyPipeline",         vkDestroyPipeline),
@@ -5973,8 +5994,11 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
             VKSTUB("vkAllocateCommandBuffers",  vkAllocateCommandBuffers),
             VKSTUB("vkFreeCommandBuffers",      vkFreeCommandBuffers),
             VKSTUB("vkGetDeviceBufferMemoryRequirements",         vkGetDeviceBufferMemoryRequirements),
+            VKSTUB("vkGetDeviceBufferMemoryRequirementsKHR", vkGetDeviceBufferMemoryRequirements),
             VKSTUB("vkGetDeviceImageMemoryRequirements",          vkGetDeviceImageMemoryRequirements),
+            VKSTUB("vkGetDeviceImageMemoryRequirementsKHR", vkGetDeviceImageMemoryRequirements),
             VKSTUB("vkGetDeviceImageSparseMemoryRequirements",    vkGetDeviceImageSparseMemoryRequirements),
+            VKSTUB("vkGetDeviceImageSparseMemoryRequirementsKHR", vkGetDeviceImageSparseMemoryRequirements),
 			            // v4: sync2 stubs (always active - translate to sync1)
             VKSTUB("vkQueueSubmit2",           vkQueueSubmit2),
             VKSTUB("vkQueueSubmit2KHR",        vkQueueSubmit2KHR),
@@ -6544,7 +6568,10 @@ vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
     auto real = RealExport<PFN_vkQueueSubmit>("vkQueueSubmit");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = real(queue, submitCount, pSubmits, fence);
-    if (r != VK_SUCCESS) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkQueueSubmit FAILED: result=%d (submits=%u)", (int)r, submitCount); }
+    InterlockedIncrement(&g_submitCount);
+    InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(r));
+    InterlockedExchange64(&g_lastSubmitTick, static_cast<LONG64>(GetTickCount64()));
+    if (r != VK_SUCCESS) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkQueueSubmit FAILED: result=%d (submits=%u)%s", (int)r, submitCount, r == VK_ERROR_DEVICE_LOST ? " VK_ERROR_DEVICE_LOST" : ""); }
     return r;
 }
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
@@ -7013,9 +7040,23 @@ vkGetDeviceBufferMemoryRequirements(VkDevice device, const VkDeviceBufferMemoryR
     auto destroy = RealExport<PFN_vkDestroyBuffer>("vkDestroyBuffer");
     if (!create || !getReq || !destroy) return;
     VkBuffer tmp = VK_NULL_HANDLE;
-    VkResult r = create(device, pInfo->pCreateInfo, nullptr, &tmp);
+    VkBufferCreateInfo patched{};
+    const VkBufferCreateInfo* ci = pInfo->pCreateInfo;
+    if (PatchSwrtBufferCreateInfo(*ci, patched)) ci = &patched;
+    VkResult r = create(device, ci, nullptr, &tmp);
     if (r == VK_SUCCESS && tmp) {
-        getReq(device, tmp, &pMemoryRequirements->memoryRequirements);
+        // Preserve output pNext, including dedicated allocation requirements.
+        auto getReq2 = RealExport<PFN_vkGetBufferMemoryRequirements2>("vkGetBufferMemoryRequirements2");
+        if (getReq2) {
+            VkBufferMemoryRequirementsInfo2 ri{};
+            ri.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2;
+            ri.buffer = tmp;
+            getReq2(device, &ri, pMemoryRequirements);
+        } else {
+            getReq(device, tmp, &pMemoryRequirements->memoryRequirements);
+            if (pMemoryRequirements->pNext && FirstTime("maintenance4:buffer-output-pnext"))
+                LogLine("!!! maintenance4 buffer requirements: output pNext unavailable on this driver");
+        }
         destroy(device, tmp, nullptr);
     } else {
         LogLine("dynrend: temp vkCreateBuffer for memory reqs failed result=%d", static_cast<int>(r));
