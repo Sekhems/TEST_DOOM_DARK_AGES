@@ -93,6 +93,8 @@ $localExports = @(
     'vkUpdateDescriptorSets',
     'vkCreateCommandPool',
     'vkCreateFence',
+    'vkResetFences',
+    'vkDestroyFence',
     'vkCreateRenderPass',
 	 'vkCmdDraw',
     'vkCmdDrawIndexed',

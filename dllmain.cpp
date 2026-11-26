@@ -135,6 +135,8 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue);
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice);
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo*, uint64_t);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t, const VkFence*);
+extern "C" VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice, VkFence, const VkAllocationCallbacks*);
 
 extern "C" VKAPI_ATTR void VKAPI_CALL
 vkGetDeviceBufferMemoryRequirements(VkDevice device,
@@ -960,6 +962,8 @@ volatile LONG64 g_lastSubmitTick = 0;
 namespace {
     int TraceSubmit2Begin(VkQueue queue, uint32_t count, VkFence fence);
     void InFlightEnd(int slot);
+    void FenceTraceSubmit(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits);
+    void FenceTraceResult(VkQueue queue, VkFence fence, VkResult result);
     VkPipelineStageFlags ConvertStage2(VkPipelineStageFlags2 s2) {
     if (s2 == 0) return 0;
     constexpr VkPipelineStageFlags kKnown =
@@ -1016,7 +1020,9 @@ vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmit
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     if (submitCount == 0 || !pSubmits) {
         const int slot = TraceSubmit2Begin(queue, 0, fence);
+        FenceTraceSubmit(queue, fence, 0, nullptr);
         VkResult sr = real(queue, 0, nullptr, fence);
+        FenceTraceResult(queue, fence, sr);
         InFlightEnd(slot);
         InterlockedIncrement(&g_submitCount);
         InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(sr));
@@ -1076,7 +1082,9 @@ vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmit
     }
     if (FirstTime("sync2:queueSubmit2")) LogLine("SYNC2: vkQueueSubmit2 -> vkQueueSubmit (+timeline values)");
     const int slot = TraceSubmit2Begin(queue, submitCount, fence);
+    FenceTraceSubmit(queue, fence, submitCount, si.data());
     const VkResult sr = real(queue, submitCount, si.data(), fence);
+    FenceTraceResult(queue, fence, sr);
     InFlightEnd(slot);
     // [v3.2] a lost device / failed submit used to be invisible in the log
     InterlockedIncrement(&g_submitCount);
@@ -3833,7 +3841,85 @@ if (si.rewritten) return std::string();
     // main thread waited for its PSO jobs -> black screen. The pipeline cache stayed at 8 KB because it was only
     // written from the present call / after a graphics pipeline, and never earlier than 120 s after the last save.
     // ======================================================================================================
-    struct InFlight { volatile LONG state; volatile LONG abandoned; DWORD tid; ULONGLONG t0; ULONGLONG lastWarn; char job[240]; };
+    // Bounded best-effort history: only dump entries for a fence whose wait is still in flight.
+    // It is diagnostic only and never queries/signals/resets a Vulkan object itself.
+    struct FenceWaitInfo { uintptr_t semaphore; uint64_t value; VkPipelineStageFlags stage; bool hasValue; };
+    struct FenceEvent {
+        uint64_t sequence; ULONGLONG tick; DWORD tid; uintptr_t fence, queue, device;
+        int kind, result; uint32_t flags, batches, commands, waits, signals, captured;
+        FenceWaitInfo wait[4];
+    };
+    constexpr size_t kFenceHistorySize = 8192;
+    FenceEvent g_fenceHistory[kFenceHistorySize]{};
+    SRWLOCK g_fenceHistoryLock = SRWLOCK_INIT;
+    uint64_t g_fenceHistorySequence = 0;
+    bool FenceTraceEnabled() { return g_spvCfgLoaded == 2 && g_spvCfg.watchdog != 0; }
+    void FenceTraceAdd(FenceEvent e) {
+        if (!e.fence || !FenceTraceEnabled()) return;
+        e.tick = GetTickCount64(); e.tid = GetCurrentThreadId();
+        AcquireSRWLockExclusive(&g_fenceHistoryLock);
+        e.sequence = ++g_fenceHistorySequence;
+        g_fenceHistory[(e.sequence - 1) % kFenceHistorySize] = e;
+        ReleaseSRWLockExclusive(&g_fenceHistoryLock);
+    }
+    // kind: 1=create, 2=reset, 3=destroy, 4=submit-enter, 5=submit-return.
+    void FenceTraceLife(VkDevice device, VkFence fence, int kind, uint32_t flags) {
+        FenceEvent e{}; e.device = (uintptr_t)device; e.fence = (uintptr_t)fence; e.kind = kind; e.flags = flags;
+        FenceTraceAdd(e);
+    }
+    void FenceTraceSubmit(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits) {
+        if (!fence || !FenceTraceEnabled()) return;
+        FenceEvent e{}; e.fence = (uintptr_t)fence; e.queue = (uintptr_t)queue; e.kind = 4; e.batches = count;
+        for (uint32_t i = 0; i < count && submits; ++i) {
+            const VkSubmitInfo& s = submits[i];
+            e.commands += s.commandBufferCount; e.waits += s.waitSemaphoreCount; e.signals += s.signalSemaphoreCount;
+            const VkTimelineSemaphoreSubmitInfo* timeline = nullptr;
+            auto p = reinterpret_cast<const VkBaseInStructure*>(s.pNext);
+            for (unsigned steps = 0; p && steps < 32; ++steps, p = p->pNext) {
+                if (p->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+                    timeline = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(p); break;
+                }
+            }
+            for (uint32_t j = 0; j < s.waitSemaphoreCount && e.captured < 4 && s.pWaitSemaphores; ++j) {
+                FenceWaitInfo& w = e.wait[e.captured++];
+                w.semaphore = (uintptr_t)s.pWaitSemaphores[j];
+                w.stage = s.pWaitDstStageMask ? s.pWaitDstStageMask[j] : 0;
+                w.hasValue = timeline && timeline->pWaitSemaphoreValues && j < timeline->waitSemaphoreValueCount;
+                w.value = w.hasValue ? timeline->pWaitSemaphoreValues[j] : 0;
+            }
+        }
+        FenceTraceAdd(e);
+    }
+    void FenceTraceResult(VkQueue queue, VkFence fence, VkResult result) {
+        FenceEvent e{}; e.fence = (uintptr_t)fence; e.queue = (uintptr_t)queue; e.kind = 5; e.result = (int)result;
+        FenceTraceAdd(e);
+    }
+    void DumpFenceHistory(VkFence fence) {
+        if (!fence) return;
+        FenceEvent found[16]{}; unsigned n = 0; uint64_t seq = 0;
+        AcquireSRWLockShared(&g_fenceHistoryLock);
+        seq = g_fenceHistorySequence;
+        for (uint64_t i = 0; i < kFenceHistorySize && i < seq && n < 16; ++i) {
+            const FenceEvent& e = g_fenceHistory[(seq - 1 - i) % kFenceHistorySize];
+            if (e.sequence && e.fence == (uintptr_t)fence) found[n++] = e;
+        }
+        ReleaseSRWLockShared(&g_fenceHistoryLock);
+        LogLine("FENCE-HISTORY fence=%p entries=%u globalEvents=%llu ringCapacity=%u (best effort, older events may be overwritten)",
+            (void*)fence, n, (unsigned long long)seq, (unsigned)kFenceHistorySize);
+        while (n) {
+            const FenceEvent& e = found[--n];
+            const char* kind = e.kind == 1 ? "create" : e.kind == 2 ? "reset" : e.kind == 3 ? "destroy" : e.kind == 4 ? "submit-enter" : "submit-return";
+            LogLine("FENCE-HISTORY seq=%llu tick=%llu thread=%lu %s device=%p queue=%p result=%d flags=0x%X batches=%u cmds=%u waits=%u signals=%u captured=%u",
+                (unsigned long long)e.sequence, (unsigned long long)e.tick, (unsigned long)e.tid, kind,
+                (void*)e.device, (void*)e.queue, e.result, e.flags, e.batches, e.commands, e.waits, e.signals, e.captured);
+            for (uint32_t j = 0; j < e.captured; ++j)
+                LogLine("FENCE-HISTORY wait[%u] semaphore=%p stage=0x%X submit_has_value=%u value=%llu (binary values ignored by driver)",
+                    j, (void*)e.wait[j].semaphore, (unsigned)e.wait[j].stage, (unsigned)e.wait[j].hasValue,
+                    (unsigned long long)e.wait[j].value);
+        }
+    }
+
+    struct InFlight { volatile LONG state; volatile LONG abandoned; DWORD tid; ULONGLONG t0; ULONGLONG lastWarn; VkFence waitFence; char job[240]; };
     constexpr int kInFlightMax = 256;
     InFlight g_inflight[kInFlightMax];
     volatile LONG g_gateBusy = 0;
@@ -3842,13 +3928,14 @@ if (si.rewritten) return std::string();
     int g_gateSize = 0;
     namespace pcache { void MaybeSave(bool force); }
 
-    int InFlightBegin(const char* job) {
+    int InFlightBegin(const char* job, VkFence waitFence = VK_NULL_HANDLE) {
         for (int i = 0; i < kInFlightMax; ++i) {
             if (InterlockedCompareExchange(&g_inflight[i].state, 1, 0) == 0) {
                 g_inflight[i].abandoned = 0;
                 g_inflight[i].tid = GetCurrentThreadId();
                 g_inflight[i].t0 = GetTickCount64();
                 g_inflight[i].lastWarn = g_inflight[i].t0;
+                g_inflight[i].waitFence = waitFence;
                 strncpy_s(g_inflight[i].job, sizeof(g_inflight[i].job), job ? job : "", _TRUNCATE);
                 InterlockedExchange(&g_inflight[i].state, 2);
                 return i;
@@ -3868,11 +3955,11 @@ if (si.rewritten) return std::string();
     // The watchdog can report them while the game thread is still inside the driver.
     struct ApiCallTrace {
         int slot = -1;
-        explicit ApiCallTrace(const char* name, const char* detail = "", bool enabled = true) {
+        explicit ApiCallTrace(const char* name, const char* detail = "", bool enabled = true, VkFence waitFence = VK_NULL_HANDLE) {
             if (!enabled || g_spvCfgLoaded != 2 || !g_spvCfg.watchdog) return;
             char job[240];
             _snprintf_s(job, sizeof(job), _TRUNCATE, "API-WAIT %s %s", name, detail);
-            slot = InFlightBegin(job);
+            slot = InFlightBegin(job, waitFence);
         }
         ~ApiCallTrace() { InFlightEnd(slot); }
         ApiCallTrace(const ApiCallTrace&) = delete;
@@ -3901,6 +3988,7 @@ if (si.rewritten) return std::string();
                     LogLine("WATCHDOG: driver call still running after %llu s (thread %lu)%s: %s",
                         static_cast<unsigned long long>(age / 1000), static_cast<unsigned long>(e.tid),
                         e.abandoned ? " [ABANDONED - result is ignored]" : "", job);
+                    if (e.waitFence) DumpFenceHistory(e.waitFence);
                 }
             }
             if (now - lastBeat >= 60000) {
@@ -5986,7 +6074,24 @@ vkCreateFence(VkDevice device, const VkFenceCreateInfo* pInfo,
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = real(device, pInfo, pAllocator, pFence);
     if (r != VK_SUCCESS) LogLine("vkCreateFence FAILED: result=%d", (int)r);
+    else if (pFence && *pFence) FenceTraceLife(device, *pFence, 1, pInfo ? (uint32_t)pInfo->flags : 0);
     return r;
+}
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL
+vkResetFences(VkDevice device, uint32_t count, const VkFence* fences) {
+    auto real = RealExport<PFN_vkResetFences>("vkResetFences");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = real(device, count, fences);
+    if (r == VK_SUCCESS && fences) for (uint32_t i = 0; i < count; ++i) FenceTraceLife(device, fences[i], 2, 0);
+    if (r != VK_SUCCESS) LogLine("vkResetFences FAILED: result=%d", (int)r);
+    return r;
+}
+extern "C" VKAPI_ATTR void VKAPI_CALL
+vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* allocator) {
+    auto real = RealExport<PFN_vkDestroyFence>("vkDestroyFence");
+    if (!real) return;
+    FenceTraceLife(device, fence, 3, 0);
+    real(device, fence, allocator);
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
@@ -6218,6 +6323,8 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
             VKSTUB("vkUpdateDescriptorSets",     vkUpdateDescriptorSets),
             VKSTUB("vkCreateCommandPool",        vkCreateCommandPool),
             VKSTUB("vkCreateFence",              vkCreateFence),
+            VKSTUB("vkResetFences",              vkResetFences),
+            VKSTUB("vkDestroyFence",            vkDestroyFence),
             VKSTUB("vkCreateRenderPass",         vkCreateRenderPass),
 			
         };
@@ -6738,7 +6845,9 @@ vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
     char detail[128];
     _snprintf_s(detail, sizeof(detail), _TRUNCATE, "queue=%p batches=%u fence=%p", (void*)queue, submitCount, (void*)fence);
     ApiCallTrace trace("vkQueueSubmit", detail);
+    FenceTraceSubmit(queue, fence, submitCount, pSubmits);
     VkResult r = real(queue, submitCount, pSubmits, fence);
+    FenceTraceResult(queue, fence, r);
     InterlockedIncrement(&g_submitCount);
     InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(r));
     InterlockedExchange64(&g_lastSubmitTick, static_cast<LONG64>(GetTickCount64()));
@@ -6760,11 +6869,13 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout) {
     auto real = RealExport<PFN_vkWaitForFences>("vkWaitForFences");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
-    char detail[160];
-    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p all=%u timeout_ns=%llu",
-        (void*)device, fenceCount, (void*)(fenceCount && pFences ? pFences[0] : VK_NULL_HANDLE), (unsigned)waitAll,
-        (unsigned long long)timeout);
-    ApiCallTrace trace("vkWaitForFences", detail, timeout != 0);
+    char detail[160]{};
+    if (timeout != 0)
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p all=%u timeout_ns=%llu",
+            (void*)device, fenceCount, (void*)(fenceCount && pFences ? pFences[0] : VK_NULL_HANDLE), (unsigned)waitAll,
+            (unsigned long long)timeout);
+    ApiCallTrace trace("vkWaitForFences", detail, timeout != 0,
+                       timeout != 0 && fenceCount == 1 && pFences ? pFences[0] : VK_NULL_HANDLE);
     VkResult r = real(device, fenceCount, pFences, waitAll, timeout);
     if (r == VK_TIMEOUT) InterlockedIncrement(&g_fenceTimeouts);
     if (r != VK_SUCCESS && r != VK_TIMEOUT) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkWaitForFences FAILED: result=%d", (int)r); }
@@ -6785,12 +6896,14 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
     auto real = RealExport<PFN_vkWaitSemaphores>("vkWaitSemaphores");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
-    char detail[160];
-    const bool first = info && info->semaphoreCount && info->pSemaphores && info->pValues;
-    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p value=%llu flags=0x%X timeout_ns=%llu",
-        (void*)device, info ? info->semaphoreCount : 0, (void*)(first ? info->pSemaphores[0] : VK_NULL_HANDLE),
-        first ? (unsigned long long)info->pValues[0] : 0ull, info ? (unsigned)info->flags : 0,
-        (unsigned long long)timeout);
+    char detail[160]{};
+    if (timeout != 0) {
+        const bool first = info && info->semaphoreCount && info->pSemaphores && info->pValues;
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p value=%llu flags=0x%X timeout_ns=%llu",
+            (void*)device, info ? info->semaphoreCount : 0, (void*)(first ? info->pSemaphores[0] : VK_NULL_HANDLE),
+            first ? (unsigned long long)info->pValues[0] : 0ull, info ? (unsigned)info->flags : 0,
+            (unsigned long long)timeout);
+    }
     ApiCallTrace trace("vkWaitSemaphores", detail, timeout != 0);
     VkResult r = real(device, info, timeout);
     if (r == VK_TIMEOUT) InterlockedIncrement(&g_semaphoreTimeouts);
@@ -7659,7 +7772,7 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
     // [SWRT] BVH builder kernels need 64-bit ints, buffer device address and scalar block layout.
     LoadSpvConfig();
     if (g_spvCfg.watchdog)
-        LogLine("API-WAIT: watchdog tracking active for submit, present, fence, semaphore and idle calls");
+        LogLine("API-WAIT: watchdog tracking active for submit, present, fence, semaphore and idle calls; FENCE-HISTORY ring=8192");
     if (g_spvCfg.recoverMissingASCalls)
         LogLine("AS recovery: experimental null-call redirect enabled");
     if (g_spvCfg.softwareRT && g_spvCfg.swrtForceFeatures) {

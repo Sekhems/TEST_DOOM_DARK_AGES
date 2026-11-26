@@ -242,7 +242,7 @@ template<typename T> T RealExport(const char* name) {
  if (!strcmp(name,"vkWaitSemaphores")) return reinterpret_cast<T>(reinterpret_cast<void*>(&waitSem));
  return nullptr;
 }
-struct ApiCallTrace { ApiCallTrace(const char*, const char*, bool enabled=true) { traced++; if(enabled) activeTrace++; } };
+struct ApiCallTrace { ApiCallTrace(const char*, const char*, bool enabled=true, VkFence=nullptr) { traced++; if(enabled) activeTrace++; } };
 template<typename... A> int _snprintf_s(char*,size_t,int,const char*, A...) { return 0; }
 LONG InterlockedIncrement(volatile LONG* p) { return ++*p; }
 void LogLine(const char*,...) {}
@@ -259,6 +259,132 @@ int main() {
  assert(vkQueueWaitIdle(queue)==VK_SUCCESS && vkDeviceWaitIdle(dev)==VK_SUCCESS);
  assert(calls==6 && traced==6 && activeTrace==4);
  assert(g_fenceTimeouts==2 && g_semaphoreTimeouts==2);
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            cpp = pathlib.Path(tmp) / "test.cpp"
+            exe = pathlib.Path(tmp) / "test"
+            cpp.write_text(prelude + wrappers + main)
+            subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(exe)], check=True)
+            subprocess.run([str(exe)], check=True)
+
+    @unittest.skipUnless(shutil.which("g++"), "requires a C++ compiler")
+    def test_fence_history_captures_waits_and_is_bounded(self):
+        # Compile the actual history implementation against minimal Vulkan/Windows mocks.
+        start = SOURCE.index("    struct FenceWaitInfo {")
+        end = SOURCE.index("    struct InFlight {", start)
+        implementation = SOURCE[start:end]
+        prelude = r'''
+#include <cstdint>
+#include <cstddef>
+#include <cstdio>
+#include <cstdarg>
+#include <cassert>
+#include <string>
+using ULONGLONG = uint64_t; using DWORD=unsigned; using VkFence=void*;
+using VkDevice=void*; using VkQueue=void*; using VkSemaphore=void*; using VkResult=int;
+using VkPipelineStageFlags=uint32_t; using SRWLOCK=int;
+constexpr int SRWLOCK_INIT=0, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO=123;
+struct VkBaseInStructure { int sType; const VkBaseInStructure* pNext; };
+struct VkTimelineSemaphoreSubmitInfo { int sType; const VkBaseInStructure* pNext; uint32_t waitSemaphoreValueCount; const uint64_t* pWaitSemaphoreValues; };
+struct VkSubmitInfo { const void* pNext; uint32_t commandBufferCount, waitSemaphoreCount, signalSemaphoreCount;
+ const VkSemaphore* pWaitSemaphores; const VkPipelineStageFlags* pWaitDstStageMask; };
+int g_spvCfgLoaded=2; struct { int watchdog=1; } g_spvCfg;
+void AcquireSRWLockExclusive(SRWLOCK*) {} void ReleaseSRWLockExclusive(SRWLOCK*) {}
+void AcquireSRWLockShared(SRWLOCK*) {} void ReleaseSRWLockShared(SRWLOCK*) {}
+ULONGLONG GetTickCount64() { return 123; } DWORD GetCurrentThreadId() { return 12; }
+std::string logs;
+void LogLine(const char* fmt, ...) { char buf[512]; va_list ap; va_start(ap,fmt); vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap); logs+=buf; logs+='\n'; }
+'''
+        main = r'''
+int main() {
+ auto fence=reinterpret_cast<void*>(0x1234), queue=reinterpret_cast<void*>(0x5678);
+ VkSemaphore waits[2]={reinterpret_cast<void*>(0x111),reinterpret_cast<void*>(0x222)};
+ VkPipelineStageFlags stages[2]={4,8}; uint64_t values[2]={7,9};
+ VkTimelineSemaphoreSubmitInfo tl{123,nullptr,2,values};
+ VkSubmitInfo submits[1]={{&tl,3,2,1,waits,stages}};
+ FenceTraceLife(nullptr,fence,1,1);
+ FenceTraceLife(nullptr,fence,2,0);
+ FenceTraceSubmit(queue,fence,1,submits);
+ FenceTraceResult(queue,fence,0);
+ assert(g_fenceHistorySequence == 4);
+ const auto& e=g_fenceHistory[2];
+ assert(e.kind==4 && e.commands==3 && e.waits==2 && e.signals==1 && e.captured==2);
+ assert(e.wait[0].semaphore==0x111 && e.wait[0].hasValue && e.wait[0].value==7 && e.wait[0].stage==4);
+ assert(e.wait[1].semaphore==0x222 && e.wait[1].value==9 && e.wait[1].stage==8);
+ DumpFenceHistory(fence);
+ assert(logs.find("entries=4")!=std::string::npos && logs.find("submit-enter")!=std::string::npos);
+ assert(logs.find("value=9")!=std::string::npos);
+ auto other=reinterpret_cast<void*>(0x999);
+ for (unsigned i=0;i<8192;++i) FenceTraceLife(nullptr,other,2,0);
+ logs.clear(); DumpFenceHistory(fence);
+ assert(logs.find("entries=0")!=std::string::npos && logs.find("older events may be overwritten")!=std::string::npos);
+ auto before=g_fenceHistorySequence; g_spvCfg.watchdog=0; FenceTraceLife(nullptr,fence,1,0);
+ assert(g_fenceHistorySequence==before);
+}
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            cpp = pathlib.Path(tmp) / "test.cpp"
+            exe = pathlib.Path(tmp) / "test"
+            cpp.write_text(prelude + implementation + main)
+            subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(exe)], check=True)
+            subprocess.run([str(exe)], check=True)
+
+    def test_fence_hooks_include_both_submit_paths_and_lifecycle(self):
+        table_start = SOURCE.index("const Entry kAlwaysTable[]")
+        table = SOURCE[table_start:SOURCE.index("};", table_start)]
+        ps = (ROOT / "build_proxy.ps1").read_text(encoding="utf-8")
+        local = ps[ps.index("$localExports = @("):ps.index("$excludedExports =")]
+        for name in ("vkCreateFence", "vkResetFences", "vkDestroyFence"):
+            self.assertRegex(table, rf'VKSTUB\("{name}",\s*{name}\)')
+            self.assertIn("'" + name + "'", local)
+        for signature in ("vkQueueSubmit(VkQueue queue,", "vkQueueSubmit2(VkQueue queue,"):
+            body = function_body(signature)
+            self.assertIn("FenceTraceSubmit(", body)
+            self.assertIn("FenceTraceResult(", body)
+        wait = function_body("vkWaitForFences(VkDevice device,")
+        self.assertIn("fenceCount == 1 && pFences ? pFences[0]", wait)
+        self.assertIn("real(device, fenceCount, pFences, waitAll, timeout)", wait)
+
+    @unittest.skipUnless(shutil.which("g++"), "requires a C++ compiler")
+    def test_fence_lifecycle_wrappers_forward_driver_results(self):
+        prelude = r'''
+#include <cstdint>
+#include <cstring>
+#include <cassert>
+using VkResult=int; using VkDevice=void*; using VkFence=void*;
+struct VkFenceCreateInfo { uint32_t flags; }; struct VkAllocationCallbacks {};
+using PFN_vkCreateFence=VkResult(*)(VkDevice,const VkFenceCreateInfo*,const VkAllocationCallbacks*,VkFence*);
+using PFN_vkResetFences=VkResult(*)(VkDevice,uint32_t,const VkFence*);
+using PFN_vkDestroyFence=void(*)(VkDevice,VkFence,const VkAllocationCallbacks*);
+constexpr VkResult VK_SUCCESS=0, VK_ERROR_INITIALIZATION_FAILED=-3;
+VkDevice dev=(void*)0x100; VkFence handle=(void*)0x200; int calls=0, events=0, lastKind=0, nextReset=0;
+VkResult create(VkDevice d,const VkFenceCreateInfo* ci,const VkAllocationCallbacks*,VkFence* f) {
+ assert(d==dev && ci->flags==1); *f=handle; calls++; return 0; }
+VkResult reset(VkDevice d,uint32_t n,const VkFence* f) { assert(d==dev && n==1 && *f==handle); calls++; return nextReset; }
+void destroy(VkDevice d,VkFence f,const VkAllocationCallbacks*) { assert(d==dev && f==handle); calls++; }
+template <typename T> T RealExport(const char* name) {
+ if (!strcmp(name,"vkCreateFence")) return reinterpret_cast<T>(reinterpret_cast<void*>(&create));
+ if (!strcmp(name,"vkResetFences")) return reinterpret_cast<T>(reinterpret_cast<void*>(&reset));
+ if (!strcmp(name,"vkDestroyFence")) return reinterpret_cast<T>(reinterpret_cast<void*>(&destroy));
+ return nullptr;
+}
+void FenceTraceLife(VkDevice d,VkFence f,int kind,uint32_t flags) {
+ assert(d==dev && f==handle); if(kind==1) assert(flags==1); events++; lastKind=kind;
+}
+void LogLine(const char*,...) {}
+'''
+        wrappers = "\n".join(prefix + function_body(signature) for prefix, signature in (
+            ("VkResult ", "vkCreateFence(VkDevice device, const VkFenceCreateInfo* pInfo,"),
+            ("VkResult ", "vkResetFences(VkDevice device, uint32_t count, const VkFence* fences)"),
+            ("void ", "vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* allocator)")))
+        main = r'''
+int main() {
+ VkFence out=nullptr; VkFenceCreateInfo ci{1};
+ assert(vkCreateFence(dev,&ci,nullptr,&out)==0 && out==handle && events==1 && lastKind==1);
+ nextReset=-4; assert(vkResetFences(dev,1,&out)==-4 && events==1);
+ nextReset=0; assert(vkResetFences(dev,1,&out)==0 && events==2 && lastKind==2);
+ vkDestroyFence(dev,out,nullptr); assert(calls==4 && events==3 && lastKind==3);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
