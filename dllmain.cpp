@@ -964,6 +964,7 @@ namespace {
     void InFlightEnd(int slot);
     void FenceTraceSubmit(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits);
     void FenceTraceResult(VkQueue queue, VkFence fence, VkResult result);
+    void SemaphoreTraceSignals(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits, VkResult result);
     VkPipelineStageFlags ConvertStage2(VkPipelineStageFlags2 s2) {
     if (s2 == 0) return 0;
     constexpr VkPipelineStageFlags kKnown =
@@ -1085,6 +1086,7 @@ vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmit
     FenceTraceSubmit(queue, fence, submitCount, si.data());
     const VkResult sr = real(queue, submitCount, si.data(), fence);
     FenceTraceResult(queue, fence, sr);
+    SemaphoreTraceSignals(queue, fence, submitCount, si.data(), sr);
     InFlightEnd(slot);
     // [v3.2] a lost device / failed submit used to be invisible in the log
     InterlockedIncrement(&g_submitCount);
@@ -3919,6 +3921,88 @@ if (si.rewritten) return std::string();
         }
     }
 
+    // Best-effort CPU-side record of submitted semaphore signals, including submits
+    // without fences. Neither a successful submit nor a recorded signal means GPU completion.
+    struct SemaphoreSignalEvent {
+        ULONGLONG tick; DWORD tid; uintptr_t semaphore, queue, fence;
+        int result; uint32_t batch, commands, waits, captured; bool hasValue; uint64_t value;
+        FenceWaitInfo wait[4];
+    };
+    constexpr size_t kSemaphoreSignalHistorySize = 32768;
+    SemaphoreSignalEvent g_semaphoreSignals[kSemaphoreSignalHistorySize]{};
+    SRWLOCK g_semaphoreSignalLock = SRWLOCK_INIT;
+    uint64_t g_semaphoreSignalSequence = 0;
+    void SemaphoreTraceSignals(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits, VkResult result) {
+        if (!FenceTraceEnabled() || !submits) return;
+        unsigned recorded = 0;
+        for (uint32_t i = 0; i < count && recorded < 64; ++i) {
+            const VkSubmitInfo& s = submits[i];
+            if (!s.signalSemaphoreCount || !s.pSignalSemaphores) continue;
+            const VkTimelineSemaphoreSubmitInfo* timeline = nullptr;
+            auto p = reinterpret_cast<const VkBaseInStructure*>(s.pNext);
+            for (unsigned steps = 0; p && steps < 32; ++steps, p = p->pNext) {
+                if (p->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+                    timeline = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(p); break;
+                }
+            }
+            SemaphoreSignalEvent base{};
+            base.tick = GetTickCount64(); base.tid = GetCurrentThreadId(); base.queue = (uintptr_t)queue;
+            base.fence = (uintptr_t)fence; base.result = (int)result; base.batch = i;
+            base.commands = s.commandBufferCount; base.waits = s.waitSemaphoreCount;
+            for (uint32_t j = 0; j < s.waitSemaphoreCount && base.captured < 4 && s.pWaitSemaphores; ++j) {
+                FenceWaitInfo& w = base.wait[base.captured++];
+                w.semaphore = (uintptr_t)s.pWaitSemaphores[j];
+                w.stage = s.pWaitDstStageMask ? s.pWaitDstStageMask[j] : 0;
+                w.hasValue = timeline && timeline->pWaitSemaphoreValues && j < timeline->waitSemaphoreValueCount;
+                w.value = w.hasValue ? timeline->pWaitSemaphoreValues[j] : 0;
+            }
+            AcquireSRWLockExclusive(&g_semaphoreSignalLock);
+            for (uint32_t j = 0; j < s.signalSemaphoreCount && recorded < 64; ++j, ++recorded) {
+                SemaphoreSignalEvent e = base; e.semaphore = (uintptr_t)s.pSignalSemaphores[j];
+                e.hasValue = timeline && timeline->pSignalSemaphoreValues && j < timeline->signalSemaphoreValueCount;
+                e.value = e.hasValue ? timeline->pSignalSemaphoreValues[j] : 0;
+                g_semaphoreSignals[g_semaphoreSignalSequence++ % kSemaphoreSignalHistorySize] = e;
+            }
+            ReleaseSRWLockExclusive(&g_semaphoreSignalLock);
+        }
+    }
+    void DumpSemaphoreSignals(uintptr_t semaphore) {
+        if (!semaphore) return;
+        SemaphoreSignalEvent found[8]{}; unsigned n = 0; uint64_t seq;
+        AcquireSRWLockShared(&g_semaphoreSignalLock);
+        seq = g_semaphoreSignalSequence;
+        for (uint64_t i = 0; i < kSemaphoreSignalHistorySize && i < seq && n < 8; ++i) {
+            const auto& e = g_semaphoreSignals[(seq - 1 - i) % kSemaphoreSignalHistorySize];
+            if (e.semaphore == semaphore) found[n++] = e;
+        }
+        ReleaseSRWLockShared(&g_semaphoreSignalLock);
+        LogLine("SEMAPHORE-SIGNALS semaphore=%p entries=%u globalEvents=%llu (submit records only; incomplete; not GPU completion)",
+            (void*)semaphore, n, (unsigned long long)seq);
+        while (n) {
+            const auto& e = found[--n];
+            LogLine("SEMAPHORE-SIGNALS tick=%llu thread=%lu queue=%p fence=%p result=%d batch=%u cmds=%u waits=%u captured=%u submit_has_value=%u value=%llu",
+                (unsigned long long)e.tick, (unsigned long)e.tid, (void*)e.queue, (void*)e.fence, e.result,
+                e.batch, e.commands, e.waits, e.captured, (unsigned)e.hasValue, (unsigned long long)e.value);
+            for (uint32_t j = 0; j < e.captured; ++j)
+                LogLine("SEMAPHORE-SIGNALS wait[%u] semaphore=%p stage=0x%X submit_has_value=%u value=%llu",
+                    j, (void*)e.wait[j].semaphore, (unsigned)e.wait[j].stage, (unsigned)e.wait[j].hasValue,
+                    (unsigned long long)e.wait[j].value);
+        }
+    }
+    void DumpFenceSignalDependencies(VkFence fence) {
+        FenceEvent latest{};
+        AcquireSRWLockShared(&g_fenceHistoryLock);
+        const uint64_t seq = g_fenceHistorySequence;
+        for (uint64_t i = 0; i < kFenceHistorySize && i < seq; ++i) {
+            const auto& e = g_fenceHistory[(seq - 1 - i) % kFenceHistorySize];
+            if (e.fence == (uintptr_t)fence && e.kind == 4) { latest = e; break; }
+        }
+        ReleaseSRWLockShared(&g_fenceHistoryLock);
+        LogLine("SEMAPHORE-SIGNALS fence=%p latest_recorded_submit_seq=%llu waits=%u captured=%u (may predate reset or miss bypassed calls)",
+            (void*)fence, (unsigned long long)latest.sequence, latest.waits, latest.captured);
+        for (uint32_t i = 0; i < latest.captured; ++i) DumpSemaphoreSignals(latest.wait[i].semaphore);
+    }
+
     // Sample zero-timeout, single-fence polls without logging on the hot path. This
     // is a bounded clue, not proof the last sampled fence caused the later stall.
     struct FencePollSample { ULONGLONG tick; DWORD tid; uintptr_t device, fence; int result; };
@@ -4028,7 +4112,7 @@ if (si.rewritten) return std::string();
                     LogLine("WATCHDOG: driver call still running after %llu s (thread %lu)%s: %s",
                         static_cast<unsigned long long>(age / 1000), static_cast<unsigned long>(e.tid),
                         e.abandoned ? " [ABANDONED - result is ignored]" : "", job);
-                    if (e.waitFence) DumpFenceHistory(e.waitFence);
+                    if (e.waitFence) { DumpFenceHistory(e.waitFence); DumpFenceSignalDependencies(e.waitFence); }
                 }
             }
             if (now - lastBeat >= 60000) {
@@ -6889,6 +6973,7 @@ vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits,
     FenceTraceSubmit(queue, fence, submitCount, pSubmits);
     VkResult r = real(queue, submitCount, pSubmits, fence);
     FenceTraceResult(queue, fence, r);
+    SemaphoreTraceSignals(queue, fence, submitCount, pSubmits, r);
     InterlockedIncrement(&g_submitCount);
     InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(r));
     InterlockedExchange64(&g_lastSubmitTick, static_cast<LONG64>(GetTickCount64()));

@@ -287,9 +287,9 @@ using VkDevice=void*; using VkQueue=void*; using VkSemaphore=void*; using VkResu
 using VkPipelineStageFlags=uint32_t; using SRWLOCK=int;
 constexpr int SRWLOCK_INIT=0, VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO=123;
 struct VkBaseInStructure { int sType; const VkBaseInStructure* pNext; };
-struct VkTimelineSemaphoreSubmitInfo { int sType; const VkBaseInStructure* pNext; uint32_t waitSemaphoreValueCount; const uint64_t* pWaitSemaphoreValues; };
+struct VkTimelineSemaphoreSubmitInfo { int sType; const VkBaseInStructure* pNext; uint32_t waitSemaphoreValueCount; const uint64_t* pWaitSemaphoreValues; uint32_t signalSemaphoreValueCount; const uint64_t* pSignalSemaphoreValues; };
 struct VkSubmitInfo { const void* pNext; uint32_t commandBufferCount, waitSemaphoreCount, signalSemaphoreCount;
- const VkSemaphore* pWaitSemaphores; const VkPipelineStageFlags* pWaitDstStageMask; };
+ const VkSemaphore* pWaitSemaphores; const VkPipelineStageFlags* pWaitDstStageMask; const VkSemaphore* pSignalSemaphores; };
 int g_spvCfgLoaded=2; struct { int watchdog=1; } g_spvCfg;
 void AcquireSRWLockExclusive(SRWLOCK*) {} void ReleaseSRWLockExclusive(SRWLOCK*) {}
 void AcquireSRWLockShared(SRWLOCK*) {} void ReleaseSRWLockShared(SRWLOCK*) {}
@@ -302,8 +302,9 @@ int main() {
  auto fence=reinterpret_cast<void*>(0x1234), queue=reinterpret_cast<void*>(0x5678);
  VkSemaphore waits[2]={reinterpret_cast<void*>(0x111),reinterpret_cast<void*>(0x222)};
  VkPipelineStageFlags stages[2]={4,8}; uint64_t values[2]={7,9};
- VkTimelineSemaphoreSubmitInfo tl{123,nullptr,2,values};
- VkSubmitInfo submits[1]={{&tl,3,2,1,waits,stages}};
+ VkSemaphore signal=reinterpret_cast<void*>(0x333); uint64_t signalValue=12;
+ VkTimelineSemaphoreSubmitInfo tl{123,nullptr,2,values,1,&signalValue};
+ VkSubmitInfo submits[1]={{&tl,3,2,1,waits,stages,&signal}};
  FenceTraceLife(nullptr,fence,1,1);
  FenceTraceLife(nullptr,fence,2,0);
  FenceTraceSubmit(queue,fence,1,submits);
@@ -316,6 +317,20 @@ int main() {
  DumpFenceHistory(fence);
  assert(logs.find("entries=4")!=std::string::npos && logs.find("submit-enter")!=std::string::npos);
  assert(logs.find("value=9")!=std::string::npos);
+ SemaphoreTraceSignals(queue,nullptr,1,submits,0);
+ assert(g_semaphoreSignalSequence==1);
+ const auto& sig=g_semaphoreSignals[0];
+ assert(sig.semaphore==0x333 && sig.fence==0 && sig.hasValue && sig.value==12);
+ assert(sig.waits==2 && sig.captured==2 && sig.wait[1].value==9);
+ logs.clear(); DumpSemaphoreSignals((uintptr_t)signal);
+ assert(logs.find("entries=1")!=std::string::npos && logs.find("not GPU completion")!=std::string::npos);
+ assert(logs.find("value=12")!=std::string::npos && logs.find("wait[1]")!=std::string::npos);
+ logs.clear(); DumpFenceSignalDependencies(fence);
+ assert(logs.find("latest_recorded_submit_seq=3")!=std::string::npos);
+ VkSemaphore many[70]; for (int i=0;i<70;++i) many[i]=signal;
+ VkSubmitInfo huge{nullptr,0,0,70,nullptr,nullptr,many};
+ SemaphoreTraceSignals(queue,fence,1,&huge,-4);
+ assert(g_semaphoreSignalSequence==65 && g_semaphoreSignals[64].result==-4);
  auto other=reinterpret_cast<void*>(0x999);
  for (unsigned i=0;i<8192;++i) FenceTraceLife(nullptr,other,2,0);
  logs.clear(); DumpFenceHistory(fence);
@@ -332,8 +347,8 @@ int main() {
  assert(logs.find("age_ms=100")!=std::string::npos && logs.find("result=0")!=std::string::npos);
  assert(logs.find("not proof of cause")!=std::string::npos);
  auto before=g_fenceHistorySequence; g_spvCfg.watchdog=0; FenceTraceLife(nullptr,fence,1,0);
- SampleFencePoll(nullptr,fence,2);
- assert(g_fenceHistorySequence==before && g_fencePollSequence==2);
+ SampleFencePoll(nullptr,fence,2); SemaphoreTraceSignals(queue,nullptr,1,submits,0);
+ assert(g_fenceHistorySequence==before && g_fencePollSequence==2 && g_semaphoreSignalSequence==65);
 }
 '''
         with tempfile.TemporaryDirectory() as tmp:
@@ -355,6 +370,8 @@ int main() {
             body = function_body(signature)
             self.assertIn("FenceTraceSubmit(", body)
             self.assertIn("FenceTraceResult(", body)
+            self.assertIn("SemaphoreTraceSignals(", body)
+        self.assertIn("DumpFenceSignalDependencies(e.waitFence)", function_body("DWORD WINAPI WatchdogProc("))
         wait = function_body("vkWaitForFences(VkDevice device,")
         self.assertIn("fenceCount == 1 && pFences ? pFences[0]", wait)
         self.assertIn("real(device, fenceCount, pFences, waitAll, timeout)", wait)
