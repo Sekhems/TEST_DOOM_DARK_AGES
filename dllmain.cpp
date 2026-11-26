@@ -57,6 +57,7 @@
 #include <vector>
 
 #include "vk_proxy_exports.generated.h"
+#include "rt_recovery_match.h"
 
 namespace { namespace swpx { inline bool EnsureInit(VkDevice dev); } }   // [SWRT] defined in swrt_proxy.h
 
@@ -1373,6 +1374,14 @@ static VKAPI_ATTR void VKAPI_CALL Stub_NoopCmd() {}
 static VKAPI_ATTR VkResult VKAPI_CALL Stub_ReturnSuccess() { return VK_SUCCESS; }   // [v3.2]
 // v7: SPIR-V analysis, crash tracer, driver protection
 // ---------------------------------------------------------------------------
+    // These forward declarations refer to the same handlers as the proc-address table below.
+    namespace stub {
+        VKAPI_ATTR VkResult VKAPI_CALL CreateAS(VkDevice, const VkAccelerationStructureCreateInfoKHR*,
+                                                const VkAllocationCallbacks*, VkAccelerationStructureKHR*);
+        VKAPI_ATTR void VKAPI_CALL GetASBuildSizes(VkDevice, VkAccelerationStructureBuildTypeKHR,
+            const VkAccelerationStructureBuildGeometryInfoKHR*, const uint32_t*, VkAccelerationStructureBuildSizesInfoKHR*);
+    }
+
 namespace {
     // ---- config (VulkanProxy.ini next to the dll, [spirv] section) ----------
     struct SpvConfig {
@@ -1383,6 +1392,7 @@ namespace {
         int swrtForceFeatures = 0; // [SWRT] force shaderInt64/bufferDeviceAddress/scalarBlockLayout into vkCreateDevice
         int swrtPatchBuffers = 1;  // [SWRT] strip RT usage bits from vkCreateBuffer
         int softwareRT = 1;        // [SWRT] emulate ray queries with a software BVH traversal (falls back to stripping)
+        int recoverMissingASCalls = 0; // experimental, opt-in null-call redirect for two AS functions
         int rewriteRayQuery = 1;   // strip ray queries from shaders (no-hit semantics) instead of denying them
         int dumpRewrite = 0;       // dump the first N rewritten shaders (input + output)
         int dumpRewriteFail = 3;   // dump the first N shaders the rewriter could not handle
@@ -1502,6 +1512,7 @@ namespace {
         g_spvCfg.dumpSamples = rd(L"DumpSamples", 0);
         g_spvCfg.rewriteRayQuery = rd(L"RewriteRayQuery", 1);
         g_spvCfg.softwareRT = rd(L"SoftwareRT", 1);
+        g_spvCfg.recoverMissingASCalls = rd(L"RecoverMissingASCalls", 0);
         g_spvCfg.swrtForceFeatures = rd(L"SwrtForceFeatures", 0);
         g_spvCfg.swrtPatchBuffers = rd(L"SwrtPatchBuffers", 1);
         g_spvCfg.dumpRewrite = rd(L"DumpRewrite", 0);
@@ -4442,6 +4453,91 @@ if (si.rewritten) return std::string();
         }
     }
 
+    // Validate complete ranges before a redirected handler dereferences them. Never change page protections.
+    bool RecoveryRange(uintptr_t ptr, size_t size, bool write) {
+        if (!ptr || !size || ptr > UINTPTR_MAX - size) return false;
+        uintptr_t end = ptr + size;
+        while (ptr < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(ptr), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+            const DWORD p = mbi.Protect & 0xff;
+            const bool rw = p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+            const bool ro = p == PAGE_READONLY || p == PAGE_EXECUTE_READ;
+            if (write ? !rw : !(rw || ro)) return false;
+            uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            if (base > UINTPTR_MAX - mbi.RegionSize) return false;
+            uintptr_t next = base + mbi.RegionSize;
+            if (next <= ptr) return false;
+            ptr = next < end ? next : end;
+        }
+        return true;
+    }
+    template <class T> bool RecoveryRead(uintptr_t ptr, T& value) {
+        SIZE_T got = 0;
+        return RecoveryRange(ptr, sizeof(T), false) &&
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ptr), &value, sizeof(T), &got) && got == sizeof(T);
+    }
+
+    bool TryRedirectMissingASCall(CONTEXT* c, uintptr_t ret) {
+        // Config is initialized before the device is created; never initialize it from an exception handler.
+        if (g_spvCfgLoaded != 2 || !g_spvCfg.recoverMissingASCalls || !g_rtSpoof || !g_lastDevice ||
+            c->Rcx != reinterpret_cast<uintptr_t>(g_lastDevice) || ret < 6) return false;
+        MEMORY_BASIC_INFORMATION codePage{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(ret - 1), &codePage, sizeof(codePage)) ||
+            codePage.Type != MEM_IMAGE || codePage.AllocationBase != GetModuleHandleW(nullptr)) return false;
+        unsigned char call[6]{};
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ret - 6), call, sizeof(call), &got) ||
+            got != sizeof(call) || call[0] != 0xFF || call[1] != 0x15) return false;
+        int32_t displacement = 0;
+        memcpy(&displacement, call + 2, sizeof(displacement));
+        uintptr_t slot = displacement >= 0 ? ret + static_cast<uint32_t>(displacement) : ret - static_cast<uint32_t>(-static_cast<int64_t>(displacement));
+        uintptr_t target = 1;
+        if (!RecoveryRead(slot, target) || target != 0) return false;
+
+        rt_recovery::Evidence e{};
+        e.enabled = e.spoof = e.sameDevice = e.gameCallIndirectNull = true;
+        e.arg2 = c->Rdx;
+        if (c->Rdx == VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR) {
+            VkAccelerationStructureBuildGeometryInfoKHR input{};
+            VkAccelerationStructureBuildSizesInfoKHR output{};
+            uintptr_t out = 0;
+            if (c->Rsp > UINTPTR_MAX - 0x28 || !RecoveryRead(c->Rsp + 0x28, out) ||
+                !RecoveryRead(c->R8, input) || !RecoveryRead(out, output)) return false;
+            e.inputType = static_cast<uint32_t>(input.sType);
+            e.outputType = static_cast<uint32_t>(output.sType);
+            e.argumentsReadable = true;
+            e.outputWritable = RecoveryRange(out, sizeof(output), true);
+            e.validPayload = input.geometryCount <= 65536 &&
+                (!input.geometryCount || RecoveryRange(c->R9, size_t(input.geometryCount) * sizeof(uint32_t), false));
+        } else {
+            VkAccelerationStructureCreateInfoKHR input{};
+            if (c->R8 != 0 || !RecoveryRead(c->Rdx, input)) return false;
+            e.inputType = static_cast<uint32_t>(input.sType);
+            e.outputType = 0;
+            e.argumentsReadable = true;
+            e.outputWritable = RecoveryRange(c->R9, sizeof(VkAccelerationStructureKHR), true);
+            e.validPayload = input.buffer != VK_NULL_HANDLE && input.size != 0;
+        }
+        const rt_recovery::Target kind = rt_recovery::Classify(e);
+        if (kind == rt_recovery::Target::BuildSizes) {
+            c->Rip = reinterpret_cast<uintptr_t>(&stub::GetASBuildSizes);
+            static volatile LONG count = 0;
+            LONG n = InterlockedIncrement(&count);
+            if (n <= 20 || n % 500 == 0) LogLine("!!! EXEC@0 redirected to proxy vkGetAccelerationStructureBuildSizesKHR (experimental, count=%ld)", (long)n);
+            return true;
+        }
+        if (kind == rt_recovery::Target::CreateAS) {
+            c->Rip = reinterpret_cast<uintptr_t>(&stub::CreateAS);
+            static volatile LONG count = 0;
+            LONG n = InterlockedIncrement(&count);
+            if (n <= 20 || n % 500 == 0) LogLine("!!! EXEC@0 redirected to proxy vkCreateAccelerationStructureKHR (experimental, count=%ld)", (long)n);
+            return true;
+        }
+        return false;
+    }
+
     void ReportCrash(PEXCEPTION_POINTERS ep);
     LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
         if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -4483,6 +4579,8 @@ if (si.rewritten) return std::string();
             __try {
                 const ULONG64 ret = *reinterpret_cast<ULONG64*>(ep->ContextRecord->Rsp);
                 if (ret > 0x10000ull) {
+                    if (TryRedirectMissingASCall(ep->ContextRecord, static_cast<uintptr_t>(ret)))
+                        return EXCEPTION_CONTINUE_EXECUTION;
                     char caller[300]; ModuleOffset((void*)ret, caller, sizeof(caller));
                     LogLine("!!! EXEC@0 skipped null call, caller=%s", caller);
                     // Capture call-site bytes and argument registers without guessing the signature.
@@ -7482,6 +7580,8 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
     }
     // [SWRT] BVH builder kernels need 64-bit ints, buffer device address and scalar block layout.
     LoadSpvConfig();
+    if (g_spvCfg.recoverMissingASCalls)
+        LogLine("AS recovery: experimental null-call redirect enabled");
     if (g_spvCfg.softwareRT && g_spvCfg.swrtForceFeatures) {
         bool got12 = false;
         for (VkBaseOutStructure* n = const_cast<VkBaseOutStructure*>(reinterpret_cast<const VkBaseOutStructure*>(ci.pNext)); n; n = n->pNext) {
