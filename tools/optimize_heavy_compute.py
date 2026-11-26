@@ -66,6 +66,7 @@ def main(argv=None):
     parser.add_argument("source", type=Path, help="spv_heavy_<hash>_0.spv from the proxy")
     parser.add_argument("--limit", type=int, required=True, help="current HeavyComputeWords (e.g. 61000)")
     parser.add_argument("--output-dir", type=Path, help="default: spv_opt directory next to input")
+    parser.add_argument("--scalar-block-layout", action="store_true", help="validate with scalarBlockLayout; requires it to be enabled on the target Vulkan device")
     parser.add_argument("--spirv-opt", help="path to spirv-opt from Vulkan SDK")
     parser.add_argument("--spirv-val", help="path to spirv-val from Vulkan SDK")
     args = parser.parse_args(argv)
@@ -81,15 +82,18 @@ def main(argv=None):
     out_dir = args.output_dir or args.source.parent / "spv_opt"
     dest = out_dir / f"spv_{key:016x}.spv"
     print(f"Input hash={key:016x}; words={len(data)//4}; limit={args.limit}", flush=True)
+    if args.scalar_block_layout:
+        print("WARNING: scalar block layout validation requires scalarBlockLayout to be enabled on the target device.", flush=True)
     if dest.exists():
         raise RuntimeError(f"Refusing to overwrite {dest}; move or remove the old candidate first")
     out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="spv_opt_") as tmp:
         candidate = Path(tmp) / "candidate.spv"
-        run([val, "--target-env", "vulkan1.2", args.source])
-        run([opt, "--target-env=vulkan1.2", "--preserve-bindings", "--preserve-interface", "--preserve-spec-constants",
+        layout = ["--scalar-block-layout"] if args.scalar_block_layout else []
+        run([val, "--target-env", "vulkan1.2", *layout, args.source])
+        run([opt, "--target-env=vulkan1.2", *layout, "--preserve-bindings", "--preserve-interface", "--preserve-spec-constants",
              "-Os", args.source, "-o", candidate])
-        run([val, "--target-env", "vulkan1.2", candidate])
+        run([val, "--target-env", "vulkan1.2", *layout, candidate])
         optimized = candidate.read_bytes()
         out_version, out_names = entries(optimized)
         if out_version != version or out_names != names:

@@ -179,6 +179,7 @@ int main() { run(false,false,true); run(true,false,false); run(true,false,true);
             self.assertEqual(len(calls.read_text().splitlines()), 3)
             self.assertIn("--preserve-bindings", calls.read_text())
             self.assertIn("--preserve-interface", calls.read_text())
+            self.assertNotIn("--scalar-block-layout", calls.read_text())
             result = subprocess.run(cmd, env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(dest.read_bytes(), shader(1))
@@ -187,6 +188,24 @@ int main() { run(false,false,true); run(true,false,false); run(true,false,true);
             cmd[cmd.index("12")] = "11"
             self.assertNotEqual(subprocess.run(cmd, env=env, capture_output=True).returncode, 0)
             self.assertFalse(dest.exists())
+            # Explicit scalar layout affects both validators and the optimizer, never by default.
+            calls.unlink()
+            cmd[cmd.index("11")] = "12"
+            result = subprocess.run(cmd + ["--scalar-block-layout"], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("requires scalarBlockLayout to be enabled", result.stdout)
+            lines = calls.read_text().splitlines()
+            self.assertEqual(len(lines), 3)
+            self.assertTrue(all("--scalar-block-layout" in line for line in lines))
+
+    def test_scalar_layout_log_reports_sanitized_device_features(self):
+        source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
+        start = source.index("// Record the value actually passed to the driver")
+        end = source.index("VkResult r = real(pd, &ci, pAllocator, pDevice)", start)
+        block = source[start:end]
+        self.assertIn("ci.pNext", block)
+        self.assertIn("f->scalarBlockLayout", block)
+        self.assertIn("sanitized Vulkan12Features.scalarBlockLayout=%u", block)
 
     def test_proxy_candidate_is_opt_in_and_guard_stays_active(self):
         source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")

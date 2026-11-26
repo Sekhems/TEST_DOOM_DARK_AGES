@@ -8021,6 +8021,16 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
         if (ci.pEnabledFeatures) localCore.shaderInt64 = VK_TRUE;
         if (!got12) LogLine("SWRT: no Vulkan12Features in the device chain - BVH builder may be unavailable");
     }
+    // Record the value actually passed to the driver, not just its advertised support.
+    // Absence of this line means the core Vulkan 1.2 feature struct was not present;
+    // it does not rule out the separate extension feature struct.
+    for (const VkBaseInStructure* n = reinterpret_cast<const VkBaseInStructure*>(ci.pNext); n; n = n->pNext) {
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+            auto* f = reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(n);
+            LogLine("SCALAR-LAYOUT: sanitized Vulkan12Features.scalarBlockLayout=%u (see vkCreateDevice result)", f->scalarBlockLayout);
+            break;
+        }
+    }
     VkResult r = real(pd, &ci, pAllocator, pDevice);
     if (r != VK_SUCCESS && edsAdded) {
         // The driver refused the extra extension: retry exactly as the game asked.
