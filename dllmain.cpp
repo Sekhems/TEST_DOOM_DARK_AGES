@@ -31,6 +31,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
+#include "optimized_compute.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <vulkan/vulkan.h>
@@ -1428,6 +1429,8 @@ namespace {
         int heavyShaderWords = 0;  // [HANGFIX] >0: shaders with more SPIR-V words than this are never sent to the driver
         int watchdog = 1;          // [HANGFIX] watchdog thread: heartbeat + in-flight report + periodic cache save
         int heavyComputeWords = 75000; // [v3.2] compute stage with >= this many SPIR-V words is never sent to the driver (0 = off)
+        int dumpHeavyCompute = 0; // opt-in: bounded dump of faked compute modules after proxy transformations
+        uint64_t optimizedComputeHash = 0; // opt-in: exactly one transformed module hash
         int computeTimeoutSec = 12;    // [v3.2] compute compile longer than this is abandoned (never succeeded after 3 s in the log)
         int pinStuckToOneCore = 1;     // [v3.2] abandoned (stuck) compile threads share ONE core
         int stallDumpSec = 20;         // [v3.2] no vkQueuePresentKHR for this long -> dump all thread stacks (0 = off)
@@ -1516,6 +1519,18 @@ namespace {
         g_spvCfg.heavyShaderWords = rd(L"HeavyShaderWords", 0);
         g_spvCfg.watchdog = rd(L"Watchdog", 1);
         g_spvCfg.heavyComputeWords = rd(L"HeavyComputeWords", 75000);
+        g_spvCfg.dumpHeavyCompute = (std::max)(0, (std::min)(16, rd(L"DumpHeavyCompute", 0)));
+        {
+            wchar_t hex[32]{}; wchar_t* end = nullptr;
+            GetPrivateProfileStringW(L"spirv", L"OptimizedComputeHash", L"", hex, 32, path);
+            bool valid = wcslen(hex) == 16;
+            for (size_t i = 0; valid && i < 16; ++i)
+                valid = (hex[i] >= L'0' && hex[i] <= L'9') || (hex[i] >= L'a' && hex[i] <= L'f') || (hex[i] >= L'A' && hex[i] <= L'F');
+            if (valid) {
+                const auto value = wcstoull(hex, &end, 16);
+                if (end == hex + 16) g_spvCfg.optimizedComputeHash = static_cast<uint64_t>(value);
+            }
+        }
         g_spvCfg.computeTimeoutSec = rd(L"ComputeTimeoutSec", 12);
         g_spvCfg.pinStuckToOneCore = rd(L"PinStuckThreads", 1);
         g_spvCfg.stallDumpSec = rd(L"StallDumpSec", 20);
@@ -3616,6 +3631,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         bool denyOther = false;   // denied for a reason other than ray tracing
         bool rewritten = false;
         size_t origWords = 0;     // [SWRT] size of the ORIGINAL module (software RT makes the sent code larger)
+        bool optimizedCompute = false; // exact transformed hash selected and candidate accepted
         std::shared_ptr<std::vector<uint32_t>> code;   // final SPIR-V sent to the driver (for post-mortem dumps)
     };
     SRWLOCK g_spvLock = SRWLOCK_INIT;
@@ -4563,6 +4579,46 @@ if (si.rewritten) return std::string();
             CloseHandle(f);
             LogLine("SPIRV: dumped %zu bytes to %ls", bytes, path);
         }
+    }
+
+    void DumpHeavyComputeOnce(const SpvInfo& si) {
+        if (!g_spvCfg.dumpHeavyCompute || !si.code || si.code->empty() || si.code->size() > 2u * 1024u * 1024u) return;
+        const uint64_t hash = optcompute::Hash(si.code->data(), si.code->size());
+        static SRWLOCK lock = SRWLOCK_INIT; static std::set<uint64_t> hashes;
+        bool shouldDump = false;
+        AcquireSRWLockExclusive(&lock);
+        if (hashes.size() < static_cast<size_t>(g_spvCfg.dumpHeavyCompute)) shouldDump = hashes.insert(hash).second;
+        ReleaseSRWLockExclusive(&lock);
+        if (!shouldDump) return;
+        wchar_t path[2048]{};
+        GetLogPath(path, sizeof(path) / sizeof(path[0]));
+        wchar_t* slash = wcsrchr(path, L'\\');
+        if (!slash) return;
+        const size_t off = static_cast<size_t>(slash + 1 - path);
+        if (_snwprintf_s(slash + 1, (sizeof(path) / sizeof(path[0])) - off, _TRUNCATE,
+            L"spv_heavy_%016llx_0.spv", (unsigned long long)hash) < 0) return;
+        HANDLE f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            LogLine("SPIRV-OPT-SAMPLE hash=%016llx not written (already exists or file error=%lu)", (unsigned long long)hash, GetLastError());
+            return;
+        }
+        const DWORD bytes = static_cast<DWORD>(si.code->size() * sizeof(uint32_t));
+        DWORD written = 0;
+        const bool ok = WriteFile(f, si.code->data(), bytes, &written, nullptr) && written == bytes;
+        CloseHandle(f);
+        if (!ok) { DeleteFileW(path); LogLine("SPIRV-OPT-SAMPLE write failed for hash=%016llx", (unsigned long long)hash); return; }
+        LogLine("SPIRV-OPT-SAMPLE hash=%016llx originalWords=%zu finalWords=%zu path=%ls (transformed input; not proven valid)",
+            (unsigned long long)hash, si.origWords, si.code->size(), path);
+    }
+    bool ReadOptimizedCompute(uint64_t hash, std::vector<uint32_t>& out) {
+        wchar_t path[2048]{};
+        GetLogPath(path, sizeof(path) / sizeof(path[0]));
+        wchar_t* slash = wcsrchr(path, L'\\');
+        if (!slash) return false;
+        const size_t off = static_cast<size_t>(slash + 1 - path);
+        if (_snwprintf_s(slash + 1, (sizeof(path) / sizeof(path[0])) - off, _TRUNCATE,
+            L"spv_opt\\spv_%016llx.spv", (unsigned long long)hash) < 0) return false;
+        return ReadReplacement(path, out);
     }
 
     // Post-mortem of a pipeline the driver rejected: log the interesting states and dump its shaders.
@@ -5533,6 +5589,20 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
 }
 
 
+    // This is an explicit one-hash experiment, not a general relaxation of the safety limit.
+    const uint32_t* baselineCode = useCode;
+    const size_t baselineWords = useWords;
+    std::vector<uint32_t> optimizedCode;
+    bool optimizedAttempt = false;
+    if (si.model == 5 && g_spvCfg.heavyComputeWords > 0 && si.origWords >= static_cast<size_t>(g_spvCfg.heavyComputeWords)
+        && g_spvCfg.optimizedComputeHash && optcompute::Hash(useCode, useWords) == g_spvCfg.optimizedComputeHash) {
+        if (ReadOptimizedCompute(g_spvCfg.optimizedComputeHash, optimizedCode) &&
+            optcompute::Accept(useCode, useWords, optimizedCode.data(), optimizedCode.size(), static_cast<size_t>(g_spvCfg.heavyComputeWords))) {
+            optimizedAttempt = true; useCode = optimizedCode.data(); useWords = optimizedCode.size();
+            LogLine("SPIRV-OPT: testing selected hash=%016llx finalWords=%zu -> %zu (GPU safety not established)",
+                (unsigned long long)g_spvCfg.optimizedComputeHash, baselineWords, useWords);
+        } else LogLine("SPIRV-OPT: selected hash=%016llx candidate missing or rejected; using original guard", (unsigned long long)g_spvCfg.optimizedComputeHash);
+    }
     ci.pCode = useCode;
     ci.codeSize = useWords * 4;
     Crumb("vkCreateShaderModule #%ld caps=[%s]", n, si.caps.c_str());
@@ -5543,6 +5613,12 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         LogLine("CAUGHT driver crash in vkCreateShaderModule #%ld (spv=%x size=%zu caps=[%s])", n, si.version, pInfo->codeSize, si.caps.c_str());
         DumpSpirv("crash", n, useCode, useWords * 4);
         r = VK_ERROR_UNKNOWN;
+    }
+    if (optimizedAttempt && r != VK_SUCCESS) {
+        LogLine("SPIRV-OPT: candidate shader module failed; retrying baseline with original guard");
+        optimizedAttempt = false; useCode = baselineCode; useWords = baselineWords;
+        ci.pCode = useCode; ci.codeSize = useWords * 4; r = VK_ERROR_UNKNOWN;
+        if (!DriverCall([&]() { r = real(device, &ci, pAllocator, pShaderModule); })) r = VK_ERROR_UNKNOWN;
     }
     // The old driver's SPIR-V front end crashes on some constructs (e.g. OpConvertUToPtr). Try equivalent
     // rewrites of the module before giving up on it.
@@ -5575,6 +5651,7 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         PutSpvInfo(*pShaderModule, si);
         return VK_SUCCESS;
     }
+    si.optimizedCompute = optimizedAttempt && variantCode.empty();
     if (g_spvCfg.keepCode) {
         if (!variantCode.empty()) si.code = std::make_shared<std::vector<uint32_t>>(variantCode);
         else si.code = std::make_shared<std::vector<uint32_t>>(useCode, useCode + useWords);
@@ -6871,7 +6948,11 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             SpvInfo hsi;
             size_t words = 0;
             if (GetSpvInfo(pCreateInfos[i].stage.module, hsi) && hsi.code) words = hsi.origWords ? hsi.origWords : hsi.code->size();   // [SWRT] compare the original size
-            if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords)) {
+            const bool admit = hsi.optimizedCompute && hsi.code && hsi.code->size() < static_cast<size_t>(g_spvCfg.heavyComputeWords);
+            if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords) && admit)
+                LogLine("SPIRV-OPT: allowing selected compute pipeline originalWords=%zu optimizedWords=%zu (experimental)", words, hsi.code->size());
+            if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords) && !admit) {
+                DumpHeavyComputeOnce(hsi);
                 heavy[i] = 1; anyHeavy = true;
                 static volatile LONG heavyC = 0;
                 const LONG hc = InterlockedIncrement(&heavyC);
