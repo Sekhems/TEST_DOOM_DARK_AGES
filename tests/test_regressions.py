@@ -41,6 +41,15 @@ class RegressionTests(unittest.TestCase):
             code = SOURCE[SOURCE.rindex(loader + "("):]
             self.assertLess(code.index("stub::Find(pName)"), code.index("g_realG"))
 
+    def test_null_call_diagnostics_are_bounded_and_do_not_replace_recovery(self):
+        handler = function_body("LONG CALLBACK CrashHandler(")
+        self.assertIn("InterlockedIncrement(&nullCallDetails) <= 20", handler)
+        self.assertIn("ReadProcessMemory(GetCurrentProcess()", handler)
+        self.assertIn("EXEC@0 caller bytes [return-16, return)", handler)
+        self.assertIn("EXEC@0 stack slot [RSP+0x28]", handler)
+        self.assertIn("ep->ContextRecord->Rip = ret", handler)
+        self.assertIn("ep->ContextRecord->Rax = 0", handler)
+
     def test_submit_counters_cover_both_paths(self):
         normal = function_body("vkQueueSubmit(VkQueue queue,")
         newer = function_body("vkQueueSubmit2(VkQueue queue,")

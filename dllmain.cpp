@@ -4484,7 +4484,38 @@ if (si.rewritten) return std::string();
                 const ULONG64 ret = *reinterpret_cast<ULONG64*>(ep->ContextRecord->Rsp);
                 if (ret > 0x10000ull) {
                     char caller[300]; ModuleOffset((void*)ret, caller, sizeof(caller));
-                LogLine("!!! EXEC@0 skipped null call, caller=%s", caller);
+                    LogLine("!!! EXEC@0 skipped null call, caller=%s", caller);
+                    // Capture call-site bytes and argument registers without guessing the signature.
+                    // Never dereference the argument pointers in the exception handler.
+                    static volatile LONG nullCallDetails = 0;
+                    if (InterlockedIncrement(&nullCallDetails) <= 20) {
+                        const CONTEXT* c = ep->ContextRecord;
+                        LogLine("!!! EXEC@0 args: RCX=%016llX RDX=%016llX R8=%016llX R9=%016llX RAX=%016llX",
+                            (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
+                            (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rax);
+                        LogLine("!!! EXEC@0 regs: RBX=%016llX RSI=%016llX RDI=%016llX R10=%016llX R11=%016llX",
+                            (unsigned long long)c->Rbx, (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
+                            (unsigned long long)c->R10, (unsigned long long)c->R11);
+                        unsigned char code[32]{};
+                        SIZE_T read = 0;
+                        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ret - sizeof(code)),
+                                              code, sizeof(code), &read) && read == sizeof(code)) {
+                            LogLine("!!! EXEC@0 caller bytes [return-32, return-16): %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                                code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7],
+                                code[8], code[9], code[10], code[11], code[12], code[13], code[14], code[15]);
+                            LogLine("!!! EXEC@0 caller bytes [return-16, return): %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                                code[16], code[17], code[18], code[19], code[20], code[21], code[22], code[23],
+                                code[24], code[25], code[26], code[27], code[28], code[29], code[30], code[31]);
+                        } else {
+                            LogLine("!!! EXEC@0 caller bytes unavailable");
+                        }
+                        // First stack-passed x64 argument, if present; its value is not dereferenced.
+                        ULONG64 arg5 = 0;
+                        read = 0;
+                        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c->Rsp + 0x28),
+                                              &arg5, sizeof(arg5), &read) && read == sizeof(arg5))
+                            LogLine("!!! EXEC@0 stack slot [RSP+0x28]=%016llX (fifth argument if present)", (unsigned long long)arg5);
+                    }
                     ep->ContextRecord->Rip = ret;
                     ep->ContextRecord->Rsp += 8;  // pop return address
                     ep->ContextRecord->Rax = 0;   // return VK_SUCCESS / nullptr
