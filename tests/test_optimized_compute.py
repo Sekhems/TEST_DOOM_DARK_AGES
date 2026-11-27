@@ -70,7 +70,7 @@ using LONG=long; using VkPipeline=void*; using VkDevice=void*; using VkPipelineC
 using VkAllocationCallbacks=int; using VkResult=int;
 constexpr VkResult VK_SUCCESS=0; constexpr VkPipeline VK_NULL_HANDLE=nullptr;
 struct Stage { int module; }; struct VkComputePipelineCreateInfo { Stage stage; };
-struct SpvInfo { size_t origWords=0; bool optimizedCompute=false; std::shared_ptr<std::vector<uint32_t>> code; };
+struct SpvInfo { size_t origWords=0; bool optimizedCompute=false; uint64_t optimizedComputeSourceHash=0; std::shared_ptr<std::vector<uint32_t>> code; };
 SpvInfo table[5]; int dumped=0, called=0;
 struct Config { int heavyComputeWords=61000; } g_spvCfg;
 bool GetSpvInfo(int n, SpvInfo& out) { out=table[n]; return true; }
@@ -106,7 +106,7 @@ int main() {
     @unittest.skipUnless(shutil.which("g++"), "requires g++")
     def test_selected_module_and_failed_candidate_retry_real_block(self):
         source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
-        start = source.index("    // This is an explicit one-hash experiment")
+        start = source.index("    // Up to two explicitly selected hashes")
         end = source.index("    // The old driver's SPIR-V front end", start)
         block = source[start:end]
         prelude = r'''
@@ -117,32 +117,35 @@ int main() {
 using VkResult=int; constexpr int VK_SUCCESS=0, VK_ERROR_UNKNOWN=-13;
 void* g_lastDevice=nullptr; volatile long g_graphicsCap49Feature=0;
 long InterlockedCompareExchange(volatile long* p, long, long) { return *p; }
-struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0, graphicsCap49VertexHash=0, graphicsCap49FragmentHash=0; } g_spvCfg;
+struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0, optimizedComputeHash2=0, graphicsCap49VertexHash=0, graphicsCap49FragmentHash=0; } g_spvCfg;
 struct Info { int model=5; size_t origWords=12; unsigned version=0x10500; std::string caps; } si;
 struct CreateInfo { const uint32_t* pCode=nullptr; size_t codeSize=0; };
 uint32_t src[]={0x07230203,0x10500,0,10,0,0x0005000f,5,1,0x6e69616d,0,0x10000};
 uint32_t dst[]={0x07230203,0x10500,0,10,0,0x0005000f,5,1,0x6e69616d,0};
-int calls=0; bool failFirst=false, candidatePresent=true;
-bool ReadOptimizedCompute(uint64_t, std::vector<uint32_t>& out) { if (!candidatePresent) return false; out.assign(dst,dst+10); return true; }
+int calls=0; bool failFirst=false, candidatePresent=true; uint64_t lastKey=0;
+bool ReadOptimizedCompute(uint64_t key, std::vector<uint32_t>& out) { lastKey=key; if (!candidatePresent) return false; out.assign(dst,dst+10); return true; }
 VkResult real(void*, CreateInfo* ci, void*, void*) {
  calls++; if (failFirst && calls==1) { assert(ci->pCode!=src); return -1; } return VK_SUCCESS;
 }
 template<class F> bool DriverCall(F f) { f(); return true; }
 void LogLine(const char*,...) {} void Crumb(const char*,...) {} void SetJob(const char*,...) {}
 void DumpSpirv(const char*,long,const uint32_t*,size_t) {}
-void run(bool select, bool fail, bool present) {
+void run(int slot, bool fail, bool present) {
  const uint32_t* useCode=src; size_t useWords=11; long n=1; CreateInfo ci{}; CreateInfo info{};
  info.codeSize=44; CreateInfo* pInfo=&info; void* device=nullptr; void* pAllocator=nullptr; void* pShaderModule=nullptr;
- calls=0; failFirst=fail; candidatePresent=present;
- g_spvCfg.optimizedComputeHash=select ? optcompute::Hash(src,11) : 0;
+ calls=0; lastKey=0; failFirst=fail; candidatePresent=present;
+ const uint64_t key=optcompute::Hash(src,11);
+ g_spvCfg.optimizedComputeHash=(slot==1 || slot==3 || slot==5) ? key : (slot==4 ? key+1 : 0);
+ g_spvCfg.optimizedComputeHash2=(slot==2 || slot==4 || slot==5) ? key : (slot==3 ? key+1 : 0);
 '''
         main = r'''
  assert(r==VK_SUCCESS);
- if (!select || !present) { assert(!optimizedAttempt && useCode==src && calls==1); }
+ assert(lastKey == (slot ? optcompute::Hash(src,11) : 0));
+ if (!slot || !present) { assert(!optimizedAttempt && useCode==src && calls==1); }
  else if (fail) { assert(!optimizedAttempt && useCode==src && calls==2); }
  else { assert(optimizedAttempt && useCode!=src && useWords==10 && calls==1); }
 }
-int main() { run(false,false,true); run(true,false,false); run(true,false,true); run(true,true,true); }
+int main() { run(0,false,true); run(1,false,false); run(1,false,true); run(1,true,true); run(2,false,false); run(2,false,true); run(2,true,true); run(3,false,true); run(4,false,true); run(5,false,true); }
 '''
         with tempfile.TemporaryDirectory() as d:
             cpp, exe = Path(d)/"module.cpp", Path(d)/"module"
@@ -228,7 +231,10 @@ int main() { run(false,false,true); run(true,false,false); run(true,false,true);
 
     def test_proxy_candidate_is_opt_in_and_guard_stays_active(self):
         source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
-        self.assertIn("g_spvCfg.optimizedComputeHash && optcompute::Hash(useCode, useWords) == g_spvCfg.optimizedComputeHash", source)
+        self.assertIn("g_spvCfg.optimizedComputeHash && h == g_spvCfg.optimizedComputeHash", source)
+        self.assertIn("g_spvCfg.optimizedComputeHash2 && h == g_spvCfg.optimizedComputeHash2", source)
+        self.assertIn("ReadOptimizedCompute(selectedComputeHash, optimizedCode)", source)
+        self.assertIn("si.optimizedComputeSourceHash = si.optimizedCompute ? selectedComputeHash : 0", source)
         self.assertIn("si.model == 5 && g_spvCfg.heavyComputeWords > 0", source)
         self.assertIn("optcompute::Accept(useCode, useWords", source)
         self.assertIn("si.optimizedCompute = optimizedAttempt && variantCode.empty()", source)

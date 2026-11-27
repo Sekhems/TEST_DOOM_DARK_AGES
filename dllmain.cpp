@@ -1433,7 +1433,8 @@ namespace {
         int watchdog = 1;          // [HANGFIX] watchdog thread: heartbeat + in-flight report + periodic cache save
         int heavyComputeWords = 75000; // [v3.2] compute stage with >= this many SPIR-V words is never sent to the driver (0 = off)
         int dumpHeavyCompute = 0; // opt-in: bounded dump of faked compute modules after proxy transformations
-        uint64_t optimizedComputeHash = 0; // opt-in: exactly one transformed module hash
+        uint64_t optimizedComputeHash = 0; // opt-in: exact transformed module hash
+        uint64_t optimizedComputeHash2 = 0; // optional second exact hash; zero by default
         uint64_t graphicsCap49VertexHash = 0, graphicsCap49FragmentHash = 0; // opt-in exact transformed hashes
         int computeTimeoutSec = 12;    // [v3.2] compute compile longer than this is abandoned (never succeeded after 3 s in the log)
         int pinStuckToOneCore = 1;     // [v3.2] abandoned (stuck) compile threads share ONE core
@@ -1544,6 +1545,7 @@ namespace {
             const uint64_t v = static_cast<uint64_t>(wcstoull(hex, &end, 16));
             return end == hex + 16 ? v : 0;
         };
+        g_spvCfg.optimizedComputeHash2 = readHash(L"OptimizedComputeHash2");
         g_spvCfg.graphicsCap49VertexHash = readHash(L"GraphicsCap49VertexHash");
         g_spvCfg.graphicsCap49FragmentHash = readHash(L"GraphicsCap49FragmentHash");
         g_spvCfg.computeTimeoutSec = rd(L"ComputeTimeoutSec", 12);
@@ -3647,6 +3649,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         bool rewritten = false;
         size_t origWords = 0;     // [SWRT] size of the ORIGINAL module (software RT makes the sent code larger)
         bool optimizedCompute = false; // exact transformed hash selected and candidate accepted
+        uint64_t optimizedComputeSourceHash = 0;
         uint64_t graphicsCap49Hash = 0; // nonzero only if the selected modified module reached the driver
         std::shared_ptr<std::vector<uint32_t>> code;   // final SPIR-V sent to the driver (for post-mortem dumps)
     };
@@ -5605,19 +5608,25 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
 }
 
 
-    // This is an explicit one-hash experiment, not a general relaxation of the safety limit.
+    // Up to two explicitly selected hashes, never a general relaxation of the safety limit.
     const uint32_t* baselineCode = useCode;
     const size_t baselineWords = useWords;
     std::vector<uint32_t> optimizedCode;
     bool optimizedAttempt = false;
+    uint64_t selectedComputeHash = 0;
     if (si.model == 5 && g_spvCfg.heavyComputeWords > 0 && si.origWords >= static_cast<size_t>(g_spvCfg.heavyComputeWords)
-        && g_spvCfg.optimizedComputeHash && optcompute::Hash(useCode, useWords) == g_spvCfg.optimizedComputeHash) {
-        if (ReadOptimizedCompute(g_spvCfg.optimizedComputeHash, optimizedCode) &&
+        && (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2)) {
+        const uint64_t h = optcompute::Hash(useCode, useWords);
+        if ((g_spvCfg.optimizedComputeHash && h == g_spvCfg.optimizedComputeHash) ||
+            (g_spvCfg.optimizedComputeHash2 && h == g_spvCfg.optimizedComputeHash2)) selectedComputeHash = h;
+    }
+    if (selectedComputeHash) {
+        if (ReadOptimizedCompute(selectedComputeHash, optimizedCode) &&
             optcompute::Accept(useCode, useWords, optimizedCode.data(), optimizedCode.size(), static_cast<size_t>(g_spvCfg.heavyComputeWords))) {
             optimizedAttempt = true; useCode = optimizedCode.data(); useWords = optimizedCode.size();
             LogLine("SPIRV-OPT: testing selected hash=%016llx finalWords=%zu -> %zu (GPU safety not established)",
-                (unsigned long long)g_spvCfg.optimizedComputeHash, baselineWords, useWords);
-        } else LogLine("SPIRV-OPT: selected hash=%016llx candidate missing or rejected; using original guard", (unsigned long long)g_spvCfg.optimizedComputeHash);
+                (unsigned long long)selectedComputeHash, baselineWords, useWords);
+        } else LogLine("SPIRV-OPT: selected hash=%016llx candidate missing or rejected; using original guard", (unsigned long long)selectedComputeHash);
     }
     // One explicitly selected vertex and fragment module only. This does not change compute hashes.
     const uint64_t graphicsHash = si.model == 0 ? g_spvCfg.graphicsCap49VertexHash :
@@ -5688,6 +5697,7 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         return VK_SUCCESS;
     }
     si.optimizedCompute = optimizedAttempt && variantCode.empty();
+    si.optimizedComputeSourceHash = si.optimizedCompute ? selectedComputeHash : 0;
     si.graphicsCap49Hash = graphicsAttempt && variantCode.empty() ? graphicsHash : 0;
     if (g_spvCfg.keepCode) {
         if (!variantCode.empty()) si.code = std::make_shared<std::vector<uint32_t>>(variantCode);
@@ -6971,7 +6981,7 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             const char* why = nullptr;
             if (PipelineQuarantined(&pCreateInfos[i].stage, 1, &why)) {
                 SpvInfo si;
-                if (g_spvCfg.optimizedComputeHash && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
                     LogLine("SPIRV-OPT: selected pipeline blocked by quarantine (%s)", why ? why : "?");
                 q[i] = 1; anyQ = true;
                 static volatile LONG qn = 0;
@@ -7005,7 +7015,8 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             if (GetSpvInfo(pCreateInfos[i].stage.module, hsi) && hsi.code) words = hsi.origWords ? hsi.origWords : hsi.code->size();   // [SWRT] compare the original size
             const bool admit = hsi.optimizedCompute && hsi.code && hsi.code->size() < static_cast<size_t>(g_spvCfg.heavyComputeWords);
             if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords) && admit)
-                LogLine("SPIRV-OPT: allowing selected compute pipeline originalWords=%zu optimizedWords=%zu (experimental)", words, hsi.code->size());
+                LogLine("SPIRV-OPT: allowing selected compute pipeline originalWords=%zu optimizedWords=%zu hash=%016llx (experimental)",
+                    words, hsi.code->size(), (unsigned long long)hsi.optimizedComputeSourceHash);
             if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords) && !admit) {
                 DumpHeavyComputeOnce(hsi);
                 heavy[i] = 1; anyHeavy = true;
@@ -7047,7 +7058,7 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             for (uint32_t i = 0; i < createInfoCount; ++i) {
                 if (toxic[i]) {
                     SpvInfo si;
-                    if (g_spvCfg.optimizedComputeHash && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                    if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
                         LogLine("SPIRV-OPT: selected pipeline blocked by toxic signature");
                     if (pPipelines) pPipelines[i] = MakeFake<VkPipeline>();
                     LONG t = InterlockedIncrement(&toxC);
@@ -7096,17 +7107,19 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
     }
     // The earlier "allowing" line only means the size gate admitted the module.
     // Log the actual driver outcome for this module; other calls may run concurrently.
-    if (g_spvCfg.optimizedComputeHash) {
+    if (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2) {
         for (uint32_t i = 0; i < createInfoCount; ++i) {
             SpvInfo si;
             if (!GetSpvInfo(pCreateInfos[i].stage.module, si) || !si.optimizedCompute) continue;
             static volatile LONG optOutcomeCount = 0;
             if (InterlockedIncrement(&optOutcomeCount) <= 40) {
                 if (!cCallOk)
-                    LogLine("SPIRV-OPT: selected pipeline driver call %s -> FAKE", cTimedOut ? "TIMED OUT" : "failed or crashed");
+                    LogLine("SPIRV-OPT: selected pipeline driver call %s hash=%016llx -> FAKE", cTimedOut ? "TIMED OUT" : "failed or crashed",
+                        (unsigned long long)si.optimizedComputeSourceHash);
                 else
-                    LogLine("SPIRV-OPT: selected pipeline driver result=%d index=%u/%u output=%p%s", (int)cr, i, createInfoCount,
-                        pPipelines ? (void*)pPipelines[i] : nullptr, cr == VK_SUCCESS ? " (GPU execution not established)" : " -> FAKE");
+                    LogLine("SPIRV-OPT: selected pipeline driver result=%d index=%u/%u hash=%016llx output=%p%s", (int)cr, i, createInfoCount,
+                        (unsigned long long)si.optimizedComputeSourceHash, pPipelines ? (void*)pPipelines[i] : nullptr,
+                        cr == VK_SUCCESS ? " (GPU execution not established)" : " -> FAKE");
             }
         }
     }
