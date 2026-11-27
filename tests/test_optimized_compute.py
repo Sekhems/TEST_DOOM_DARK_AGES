@@ -111,10 +111,13 @@ int main() {
         block = source[start:end]
         prelude = r'''
 #include "optimized_compute.h"
+#include "graphics_cap49.h"
 #include <cassert>
 #include <vector>
 using VkResult=int; constexpr int VK_SUCCESS=0, VK_ERROR_UNKNOWN=-13;
-struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0; } g_spvCfg;
+void* g_lastDevice=nullptr; volatile long g_graphicsCap49Feature=0;
+long InterlockedCompareExchange(volatile long* p, long, long) { return *p; }
+struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0, graphicsCap49VertexHash=0, graphicsCap49FragmentHash=0; } g_spvCfg;
 struct Info { int model=5; size_t origWords=12; unsigned version=0x10500; std::string caps; } si;
 struct CreateInfo { const uint32_t* pCode=nullptr; size_t codeSize=0; };
 uint32_t src[]={0x07230203,0x10500,0,10,0,0x0005000f,5,1,0x6e69616d,0,0x10000};

@@ -1,7 +1,7 @@
 # Программная трассировка (SWRT) для VulkanProxy
 
 ## Как собрать
-Положите рядом с dllmain.cpp: `swrt_build.h swrt_spv.h swrt_proxy.h swrt_rq.h swrt_rq_spv.h rt_recovery_match.h optimized_compute.h`
+Положите рядом с dllmain.cpp: `swrt_build.h swrt_spv.h swrt_proxy.h swrt_rq.h swrt_rq_spv.h rt_recovery_match.h optimized_compute.h graphics_cap49.h`
 (`dllmain.cpp` их подключает сам). Не заменяйте рабочий `VulkanProxy.ini` без резервной копии; новые параметры добавляйте отдельно. Новых зависимостей DLL нет.
 `swrt_spv.h` / `swrt_rq_spv.h` сгенерированы из `swrt_dev/shaders/*.comp`
 (`python gen_spv.py`, `python gen_rq.py`, нужен glslangValidator) — трогать их руками не надо.

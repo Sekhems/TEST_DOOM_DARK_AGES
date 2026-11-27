@@ -32,6 +32,7 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include "optimized_compute.h"
+#include "graphics_cap49.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <vulkan/vulkan.h>
@@ -212,6 +213,8 @@ namespace {
 
     // 1 = VK_EXT_extended_dynamic_state was enabled on the real device (core 1.3 vkCmdSet* are routed to it).
     volatile LONG g_edsEnabled = 0;
+    // Feature on the last successfully created device, after clamping. Never force it on.
+    volatile LONG g_graphicsCap49Feature = 0;
 
 // [v3.2] frame / submit counters for the watchdog heartbeat and the stall detector.
 volatile LONG g_presentCount = 0;
@@ -1431,6 +1434,7 @@ namespace {
         int heavyComputeWords = 75000; // [v3.2] compute stage with >= this many SPIR-V words is never sent to the driver (0 = off)
         int dumpHeavyCompute = 0; // opt-in: bounded dump of faked compute modules after proxy transformations
         uint64_t optimizedComputeHash = 0; // opt-in: exactly one transformed module hash
+        uint64_t graphicsCap49VertexHash = 0, graphicsCap49FragmentHash = 0; // opt-in exact transformed hashes
         int computeTimeoutSec = 12;    // [v3.2] compute compile longer than this is abandoned (never succeeded after 3 s in the log)
         int pinStuckToOneCore = 1;     // [v3.2] abandoned (stuck) compile threads share ONE core
         int stallDumpSec = 20;         // [v3.2] no vkQueuePresentKHR for this long -> dump all thread stacks (0 = off)
@@ -1531,6 +1535,17 @@ namespace {
                 if (end == hex + 16) g_spvCfg.optimizedComputeHash = static_cast<uint64_t>(value);
             }
         }
+        auto readHash = [&](const wchar_t* key) -> uint64_t {
+            wchar_t hex[32]{}; wchar_t* end = nullptr;
+            GetPrivateProfileStringW(L"spirv", key, L"", hex, 32, path);
+            if (wcslen(hex) != 16) return 0;
+            for (size_t i = 0; i < 16; ++i)
+                if (!((hex[i] >= L'0' && hex[i] <= L'9') || (hex[i] >= L'a' && hex[i] <= L'f') || (hex[i] >= L'A' && hex[i] <= L'F'))) return 0;
+            const uint64_t v = static_cast<uint64_t>(wcstoull(hex, &end, 16));
+            return end == hex + 16 ? v : 0;
+        };
+        g_spvCfg.graphicsCap49VertexHash = readHash(L"GraphicsCap49VertexHash");
+        g_spvCfg.graphicsCap49FragmentHash = readHash(L"GraphicsCap49FragmentHash");
         g_spvCfg.computeTimeoutSec = rd(L"ComputeTimeoutSec", 12);
         g_spvCfg.pinStuckToOneCore = rd(L"PinStuckThreads", 1);
         g_spvCfg.stallDumpSec = rd(L"StallDumpSec", 20);
@@ -3632,6 +3647,7 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         bool rewritten = false;
         size_t origWords = 0;     // [SWRT] size of the ORIGINAL module (software RT makes the sent code larger)
         bool optimizedCompute = false; // exact transformed hash selected and candidate accepted
+        uint64_t graphicsCap49Hash = 0; // nonzero only if the selected modified module reached the driver
         std::shared_ptr<std::vector<uint32_t>> code;   // final SPIR-V sent to the driver (for post-mortem dumps)
     };
     SRWLOCK g_spvLock = SRWLOCK_INIT;
@@ -5603,6 +5619,20 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
                 (unsigned long long)g_spvCfg.optimizedComputeHash, baselineWords, useWords);
         } else LogLine("SPIRV-OPT: selected hash=%016llx candidate missing or rejected; using original guard", (unsigned long long)g_spvCfg.optimizedComputeHash);
     }
+    // One explicitly selected vertex and fragment module only. This does not change compute hashes.
+    const uint64_t graphicsHash = si.model == 0 ? g_spvCfg.graphicsCap49VertexHash :
+                                  si.model == 4 ? g_spvCfg.graphicsCap49FragmentHash : 0;
+    std::vector<uint32_t> graphicsCapCode;
+    bool graphicsAttempt = false;
+    if (graphicsHash && optcompute::Hash(useCode, useWords) == graphicsHash) {
+        const bool enabled = device == g_lastDevice && InterlockedCompareExchange(&g_graphicsCap49Feature, 0, 0) != 0;
+        if (graphicscap49::AddForSelectedModule(useCode, useWords, si.model, graphicsHash, enabled, graphicsCapCode)) {
+            graphicsAttempt = true; useCode = graphicsCapCode.data(); useWords = graphicsCapCode.size();
+            LogLine("GRAPHICS-CAP49: testing selected model=%u hash=%016llx words=%zu (experimental)", si.model,
+                (unsigned long long)graphicsHash, useWords);
+        } else LogLine("GRAPHICS-CAP49: selected model=%u hash=%016llx not applied (feature disabled or module rejected)",
+            si.model, (unsigned long long)graphicsHash);
+    }
     ci.pCode = useCode;
     ci.codeSize = useWords * 4;
     Crumb("vkCreateShaderModule #%ld caps=[%s]", n, si.caps.c_str());
@@ -5617,6 +5647,12 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
     if (optimizedAttempt && r != VK_SUCCESS) {
         LogLine("SPIRV-OPT: candidate shader module failed; retrying baseline with original guard");
         optimizedAttempt = false; useCode = baselineCode; useWords = baselineWords;
+        ci.pCode = useCode; ci.codeSize = useWords * 4; r = VK_ERROR_UNKNOWN;
+        if (!DriverCall([&]() { r = real(device, &ci, pAllocator, pShaderModule); })) r = VK_ERROR_UNKNOWN;
+    }
+    if (graphicsAttempt && r != VK_SUCCESS) {
+        LogLine("GRAPHICS-CAP49: shader module failed; retrying baseline");
+        graphicsAttempt = false; useCode = baselineCode; useWords = baselineWords;
         ci.pCode = useCode; ci.codeSize = useWords * 4; r = VK_ERROR_UNKNOWN;
         if (!DriverCall([&]() { r = real(device, &ci, pAllocator, pShaderModule); })) r = VK_ERROR_UNKNOWN;
     }
@@ -5652,6 +5688,7 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         return VK_SUCCESS;
     }
     si.optimizedCompute = optimizedAttempt && variantCode.empty();
+    si.graphicsCap49Hash = graphicsAttempt && variantCode.empty() ? graphicsHash : 0;
     if (g_spvCfg.keepCode) {
         if (!variantCode.empty()) si.code = std::make_shared<std::vector<uint32_t>>(variantCode);
         else si.code = std::make_shared<std::vector<uint32_t>>(useCode, useCode + useWords);
@@ -6785,6 +6822,21 @@ vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count
         auto modsP = std::make_shared<std::vector<VkGraphicsPipelineCreateInfo>>(mods);
         bool timedOut = false;
         const bool callOk = DriverCallTimed([=]() { *resP = real(device, cache, count, modsP->data(), pAllocator, outP->data()); }, timedOut);
+        if (g_spvCfg.graphicsCap49VertexHash || g_spvCfg.graphicsCap49FragmentHash) {
+            for (uint32_t i = 0; i < count; ++i) {
+                for (uint32_t j = 0; pCreateInfos[i].pStages && j < pCreateInfos[i].stageCount; ++j) {
+                    SpvInfo tracked;
+                    if (!GetSpvInfo(pCreateInfos[i].pStages[j].module, tracked) || !tracked.graphicsCap49Hash) continue;
+                    static volatile LONG capOutcome = 0;
+                    if (InterlockedIncrement(&capOutcome) <= 40) {
+                        if (callOk) LogLine("GRAPHICS-CAP49: pipeline result=%d index=%u/%u model=%u hash=%016llx output=%p (GPU execution not established)",
+                            (int)*resP, i, count, tracked.model, (unsigned long long)tracked.graphicsCap49Hash, (void*)(*outP)[i]);
+                        else LogLine("GRAPHICS-CAP49: pipeline driver call %s model=%u hash=%016llx -> FAKE",
+                            timedOut ? "TIMED OUT" : "failed or crashed", tracked.model, (unsigned long long)tracked.graphicsCap49Hash);
+                    }
+                }
+            }
+        }
         if (callOk) {
             r = *resP;
             if (pPipelines) for (uint32_t i = 0; i < count; ++i) pPipelines[i] = (*outP)[i];
@@ -8065,6 +8117,21 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
         r = real(pd, &ci, pAllocator, pDevice);
     }
     if (r == VK_SUCCESS && edsAvail) InterlockedExchange(&g_edsEnabled, 1);
+
+    // Examine the actual sanitized core features passed to the successful driver call,
+    // before restoring the application's pNext chain. Do not enable any new feature.
+    bool cap49Enabled = ci.pEnabledFeatures && ci.pEnabledFeatures->shaderStorageImageExtendedFormats;
+    bool hasFeature2 = false;
+    unsigned capGuard = 0;
+    for (const VkBaseInStructure* n = reinterpret_cast<const VkBaseInStructure*>(ci.pNext); n && capGuard++ < 128; n = n->pNext) {
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            hasFeature2 = true;
+            cap49Enabled = reinterpret_cast<const VkPhysicalDeviceFeatures2*>(n)->features.shaderStorageImageExtendedFormats != VK_FALSE;
+        }
+    }
+    if (ci.pEnabledFeatures && hasFeature2) cap49Enabled = false; // invalid/ambiguous chain: fail closed
+    if (r == VK_SUCCESS) InterlockedExchange(&g_graphicsCap49Feature, cap49Enabled ? 1 : 0);
+    LogLine("GRAPHICS-CAP49: sanitized shaderStorageImageExtendedFormats=%u deviceResult=%d", cap49Enabled ? 1u : 0u, (int)r);
 
     for (size_t i = unlinked.size(); i-- > 0;) *unlinked[i].link = unlinked[i].node;
     for (auto& sv : saved) {
