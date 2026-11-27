@@ -1,5 +1,6 @@
 """Bounded graphics capability experiment tests; not Windows or GPU tests."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import tempfile
@@ -12,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class GraphicsCapTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("g++"), "requires g++")
     def test_real_helper_on_user_modules_and_negative_gates(self):
-        archive = ROOT / "spv_gpfail10_stage1_0.zip"
+        fixture = os.environ.get("GRAPHICS_CAP49_FIXTURE")
+        archive = Path(fixture) if fixture else ROOT / "spv_gpfail10_stage1_0.zip"
         if not archive.exists():
             self.skipTest("user archive not available")
         cpp = r'''

@@ -1436,6 +1436,7 @@ namespace {
         uint64_t optimizedComputeHash = 0; // opt-in: exact transformed module hash
         uint64_t optimizedComputeHash2 = 0; // optional second exact hash; zero by default
         uint64_t optimizedComputeHash3 = 0; // optional third exact hash; zero by default
+        uint64_t optimizedComputeHash4 = 0; // optional fourth exact hash; zero by default
         uint64_t graphicsCap49VertexHash = 0, graphicsCap49FragmentHash = 0; // opt-in exact transformed hashes
         int computeTimeoutSec = 12;    // [v3.2] compute compile longer than this is abandoned (never succeeded after 3 s in the log)
         int pinStuckToOneCore = 1;     // [v3.2] abandoned (stuck) compile threads share ONE core
@@ -1548,6 +1549,7 @@ namespace {
         };
         g_spvCfg.optimizedComputeHash2 = readHash(L"OptimizedComputeHash2");
         g_spvCfg.optimizedComputeHash3 = readHash(L"OptimizedComputeHash3");
+        g_spvCfg.optimizedComputeHash4 = readHash(L"OptimizedComputeHash4");
         g_spvCfg.graphicsCap49VertexHash = readHash(L"GraphicsCap49VertexHash");
         g_spvCfg.graphicsCap49FragmentHash = readHash(L"GraphicsCap49FragmentHash");
         g_spvCfg.computeTimeoutSec = rd(L"ComputeTimeoutSec", 12);
@@ -5610,18 +5612,19 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
 }
 
 
-    // Up to three explicitly selected hashes, never a general relaxation of the safety limit.
+    // Up to four explicitly selected hashes, never a general relaxation of the safety limit.
     const uint32_t* baselineCode = useCode;
     const size_t baselineWords = useWords;
     std::vector<uint32_t> optimizedCode;
     bool optimizedAttempt = false;
     uint64_t selectedComputeHash = 0;
     if (si.model == 5 && g_spvCfg.heavyComputeWords > 0 && si.origWords >= static_cast<size_t>(g_spvCfg.heavyComputeWords)
-        && (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3)) {
+        && (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4)) {
         const uint64_t h = optcompute::Hash(useCode, useWords);
         if ((g_spvCfg.optimizedComputeHash && h == g_spvCfg.optimizedComputeHash) ||
             (g_spvCfg.optimizedComputeHash2 && h == g_spvCfg.optimizedComputeHash2) ||
-            (g_spvCfg.optimizedComputeHash3 && h == g_spvCfg.optimizedComputeHash3)) selectedComputeHash = h;
+            (g_spvCfg.optimizedComputeHash3 && h == g_spvCfg.optimizedComputeHash3) ||
+            (g_spvCfg.optimizedComputeHash4 && h == g_spvCfg.optimizedComputeHash4)) selectedComputeHash = h;
     }
     if (selectedComputeHash) {
         if (ReadOptimizedCompute(selectedComputeHash, optimizedCode) &&
@@ -6984,7 +6987,7 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             const char* why = nullptr;
             if (PipelineQuarantined(&pCreateInfos[i].stage, 1, &why)) {
                 SpvInfo si;
-                if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
                     LogLine("SPIRV-OPT: selected pipeline blocked by quarantine (%s)", why ? why : "?");
                 q[i] = 1; anyQ = true;
                 static volatile LONG qn = 0;
@@ -7061,7 +7064,7 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             for (uint32_t i = 0; i < createInfoCount; ++i) {
                 if (toxic[i]) {
                     SpvInfo si;
-                    if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                    if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
                         LogLine("SPIRV-OPT: selected pipeline blocked by toxic signature");
                     if (pPipelines) pPipelines[i] = MakeFake<VkPipeline>();
                     LONG t = InterlockedIncrement(&toxC);
@@ -7110,7 +7113,7 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
     }
     // The earlier "allowing" line only means the size gate admitted the module.
     // Log the actual driver outcome for this module; other calls may run concurrently.
-    if (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3) {
+    if (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4) {
         for (uint32_t i = 0; i < createInfoCount; ++i) {
             SpvInfo si;
             if (!GetSpvInfo(pCreateInfos[i].stage.module, si) || !si.optimizedCompute) continue;
