@@ -106,7 +106,7 @@ int main() {
     @unittest.skipUnless(shutil.which("g++"), "requires g++")
     def test_selected_module_and_failed_candidate_retry_real_block(self):
         source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
-        start = source.index("    // Up to two explicitly selected hashes")
+        start = source.index("    // Up to three explicitly selected hashes")
         end = source.index("    // The old driver's SPIR-V front end", start)
         block = source[start:end]
         prelude = r'''
@@ -117,7 +117,7 @@ int main() {
 using VkResult=int; constexpr int VK_SUCCESS=0, VK_ERROR_UNKNOWN=-13;
 void* g_lastDevice=nullptr; volatile long g_graphicsCap49Feature=0;
 long InterlockedCompareExchange(volatile long* p, long, long) { return *p; }
-struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0, optimizedComputeHash2=0, graphicsCap49VertexHash=0, graphicsCap49FragmentHash=0; } g_spvCfg;
+struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0, optimizedComputeHash2=0, optimizedComputeHash3=0, graphicsCap49VertexHash=0, graphicsCap49FragmentHash=0; } g_spvCfg;
 struct Info { int model=5; size_t origWords=12; unsigned version=0x10500; std::string caps; } si;
 struct CreateInfo { const uint32_t* pCode=nullptr; size_t codeSize=0; };
 uint32_t src[]={0x07230203,0x10500,0,10,0,0x0005000f,5,1,0x6e69616d,0,0x10000};
@@ -137,15 +137,18 @@ void run(int slot, bool fail, bool present) {
  const uint64_t key=optcompute::Hash(src,11);
  g_spvCfg.optimizedComputeHash=(slot==1 || slot==3 || slot==5) ? key : (slot==4 ? key+1 : 0);
  g_spvCfg.optimizedComputeHash2=(slot==2 || slot==4 || slot==5) ? key : (slot==3 ? key+1 : 0);
+ g_spvCfg.optimizedComputeHash3=(slot==6 || slot==7 || slot==8) ? key : (slot==9 ? key+1 : 0);
+ if (slot==7) { g_spvCfg.optimizedComputeHash=key+1; g_spvCfg.optimizedComputeHash2=key+2; }
+ if (slot==8) { g_spvCfg.optimizedComputeHash=key; g_spvCfg.optimizedComputeHash2=key; }
 '''
         main = r'''
  assert(r==VK_SUCCESS);
- assert(lastKey == (slot ? optcompute::Hash(src,11) : 0));
- if (!slot || !present) { assert(!optimizedAttempt && useCode==src && calls==1); }
+ assert(lastKey == ((slot && slot!=9) ? optcompute::Hash(src,11) : 0));
+ if (!slot || slot==9 || !present) { assert(!optimizedAttempt && useCode==src && calls==1); }
  else if (fail) { assert(!optimizedAttempt && useCode==src && calls==2); }
  else { assert(optimizedAttempt && useCode!=src && useWords==10 && calls==1); }
 }
-int main() { run(0,false,true); run(1,false,false); run(1,false,true); run(1,true,true); run(2,false,false); run(2,false,true); run(2,true,true); run(3,false,true); run(4,false,true); run(5,false,true); }
+int main() { run(0,false,true); run(1,false,false); run(1,false,true); run(1,true,true); run(2,false,false); run(2,false,true); run(2,true,true); run(3,false,true); run(4,false,true); run(5,false,true); run(6,false,false); run(6,false,true); run(6,true,true); run(7,false,true); run(8,false,true); run(9,false,true); }
 '''
         with tempfile.TemporaryDirectory() as d:
             cpp, exe = Path(d)/"module.cpp", Path(d)/"module"
@@ -233,6 +236,7 @@ int main() { run(0,false,true); run(1,false,false); run(1,false,true); run(1,tru
         source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
         self.assertIn("g_spvCfg.optimizedComputeHash && h == g_spvCfg.optimizedComputeHash", source)
         self.assertIn("g_spvCfg.optimizedComputeHash2 && h == g_spvCfg.optimizedComputeHash2", source)
+        self.assertIn("g_spvCfg.optimizedComputeHash3 && h == g_spvCfg.optimizedComputeHash3", source)
         self.assertIn("ReadOptimizedCompute(selectedComputeHash, optimizedCode)", source)
         self.assertIn("si.optimizedComputeSourceHash = si.optimizedCompute ? selectedComputeHash : 0", source)
         self.assertIn("si.model == 5 && g_spvCfg.heavyComputeWords > 0", source)
