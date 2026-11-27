@@ -6918,6 +6918,9 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
         for (uint32_t i = 0; i < createInfoCount; ++i) {
             const char* why = nullptr;
             if (PipelineQuarantined(&pCreateInfos[i].stage, 1, &why)) {
+                SpvInfo si;
+                if (g_spvCfg.optimizedComputeHash && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                    LogLine("SPIRV-OPT: selected pipeline blocked by quarantine (%s)", why ? why : "?");
                 q[i] = 1; anyQ = true;
                 static volatile LONG qn = 0;
                 const LONG t = InterlockedIncrement(&qn);
@@ -6991,6 +6994,9 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             std::vector<uint32_t> subIdx;
             for (uint32_t i = 0; i < createInfoCount; ++i) {
                 if (toxic[i]) {
+                    SpvInfo si;
+                    if (g_spvCfg.optimizedComputeHash && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                        LogLine("SPIRV-OPT: selected pipeline blocked by toxic signature");
                     if (pPipelines) pPipelines[i] = MakeFake<VkPipeline>();
                     LONG t = InterlockedIncrement(&toxC);
                     if (t <= 10 || t % 50 == 0)
@@ -7034,6 +7040,22 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             cr = *resP;
             if (pPipelines) for (uint32_t i = 0; i < createInfoCount; ++i) pPipelines[i] = (*outP)[i];
             if (cr == VK_SUCCESS) pcache::Dirty();
+        }
+    }
+    // The earlier "allowing" line only means the size gate admitted the module.
+    // Log the actual driver outcome for this module; other calls may run concurrently.
+    if (g_spvCfg.optimizedComputeHash) {
+        for (uint32_t i = 0; i < createInfoCount; ++i) {
+            SpvInfo si;
+            if (!GetSpvInfo(pCreateInfos[i].stage.module, si) || !si.optimizedCompute) continue;
+            static volatile LONG optOutcomeCount = 0;
+            if (InterlockedIncrement(&optOutcomeCount) <= 40) {
+                if (!cCallOk)
+                    LogLine("SPIRV-OPT: selected pipeline driver call %s -> FAKE", cTimedOut ? "TIMED OUT" : "failed or crashed");
+                else
+                    LogLine("SPIRV-OPT: selected pipeline driver result=%d index=%u/%u output=%p%s", (int)cr, i, createInfoCount,
+                        pPipelines ? (void*)pPipelines[i] : nullptr, cr == VK_SUCCESS ? " (GPU execution not established)" : " -> FAKE");
+            }
         }
     }
     if (!cCallOk) {

@@ -207,6 +207,22 @@ int main() { run(false,false,true); run(true,false,false); run(true,false,true);
         self.assertIn("f->scalarBlockLayout", block)
         self.assertIn("sanitized Vulkan12Features.scalarBlockLayout=%u", block)
 
+    def test_selected_pipeline_outcome_is_reported_after_driver_call(self):
+        source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
+        start = source.index("vkCreateComputePipelines(VkDevice device, VkPipelineCache")
+        end = source.index("// Pass-through wrappers", start)
+        block = source[start:end]
+        self.assertIn("selected pipeline blocked by quarantine", block)
+        self.assertIn("selected pipeline blocked by toxic signature", block)
+        driver = block.index("cCallOk = DriverCallTimed")
+        outcome = block.index("selected pipeline driver result=%d")
+        fake = block.index('vkCreateComputePipelines FAILED: result=%d')
+        self.assertLess(driver, outcome)
+        self.assertLess(outcome, fake)
+        self.assertIn("!si.optimizedCompute", block[driver:outcome])
+        self.assertIn("GPU execution not established", block[outcome:fake])
+        self.assertIn("optOutcomeCount) <= 40", block[driver:outcome])
+
     def test_proxy_candidate_is_opt_in_and_guard_stays_active(self):
         source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
         self.assertIn("g_spvCfg.optimizedComputeHash && optcompute::Hash(useCode, useWords) == g_spvCfg.optimizedComputeHash", source)
