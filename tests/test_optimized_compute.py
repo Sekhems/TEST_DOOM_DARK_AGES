@@ -106,7 +106,7 @@ int main() {
     @unittest.skipUnless(shutil.which("g++"), "requires g++")
     def test_selected_module_and_failed_candidate_retry_real_block(self):
         source = (ROOT / "dllmain.cpp").read_text(encoding="utf-8")
-        start = source.index("    // Up to six explicitly selected hashes")
+        start = source.index("    // Up to seven explicitly selected hashes")
         end = source.index("    // The old driver's SPIR-V front end", start)
         block = source[start:end]
         prelude = r'''
@@ -117,7 +117,7 @@ int main() {
 using VkResult=int; constexpr int VK_SUCCESS=0, VK_ERROR_UNKNOWN=-13;
 void* g_lastDevice=nullptr; volatile long g_graphicsCap49Feature=0;
 long InterlockedCompareExchange(volatile long* p, long, long) { return *p; }
-struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0, optimizedComputeHash2=0, optimizedComputeHash3=0, optimizedComputeHash4=0, optimizedComputeHash5=0, optimizedComputeHash6=0, graphicsCap49VertexHash=0, graphicsCap49FragmentHash=0; } g_spvCfg;
+struct Config { int heavyComputeWords=11; uint64_t optimizedComputeHash=0, optimizedComputeHash2=0, optimizedComputeHash3=0, optimizedComputeHash4=0, optimizedComputeHash5=0, optimizedComputeHash6=0, optimizedComputeHash7=0, graphicsCap49VertexHash=0, graphicsCap49FragmentHash=0; } g_spvCfg;
 struct Info { int model=5; size_t origWords=12; unsigned version=0x10500; std::string caps; } si;
 struct CreateInfo { const uint32_t* pCode=nullptr; size_t codeSize=0; };
 uint32_t src[]={0x07230203,0x10500,0,10,0,0x0005000f,5,1,0x6e69616d,0,0x10000};
@@ -149,15 +149,18 @@ void run(int slot, bool fail, bool present) {
  g_spvCfg.optimizedComputeHash6=(slot==18 || slot==19 || slot==20) ? key : (slot==21 ? key+1 : 0);
  if (slot==19) { g_spvCfg.optimizedComputeHash=key+1; g_spvCfg.optimizedComputeHash2=key+2; g_spvCfg.optimizedComputeHash3=key+3; g_spvCfg.optimizedComputeHash4=key+4; g_spvCfg.optimizedComputeHash5=key+5; }
  if (slot==20) { g_spvCfg.optimizedComputeHash=key; g_spvCfg.optimizedComputeHash2=key; g_spvCfg.optimizedComputeHash3=key; g_spvCfg.optimizedComputeHash4=key; g_spvCfg.optimizedComputeHash5=key; }
+ g_spvCfg.optimizedComputeHash7=(slot==22 || slot==23 || slot==24) ? key : (slot==25 ? key+1 : 0);
+ if (slot==23) { g_spvCfg.optimizedComputeHash=key+1; g_spvCfg.optimizedComputeHash2=key+2; g_spvCfg.optimizedComputeHash3=key+3; g_spvCfg.optimizedComputeHash4=key+4; g_spvCfg.optimizedComputeHash5=key+5; g_spvCfg.optimizedComputeHash6=key+6; }
+ if (slot==24) { g_spvCfg.optimizedComputeHash=key; g_spvCfg.optimizedComputeHash2=key; g_spvCfg.optimizedComputeHash3=key; g_spvCfg.optimizedComputeHash4=key; g_spvCfg.optimizedComputeHash5=key; g_spvCfg.optimizedComputeHash6=key; }
 '''
         main = r'''
  assert(r==VK_SUCCESS);
- assert(lastKey == ((slot && slot!=9 && slot!=13 && slot!=17 && slot!=21) ? optcompute::Hash(src,11) : 0));
- if (!slot || slot==9 || slot==13 || slot==17 || slot==21 || !present) { assert(!optimizedAttempt && useCode==src && calls==1); }
+ assert(lastKey == ((slot && slot!=9 && slot!=13 && slot!=17 && slot!=21 && slot!=25) ? optcompute::Hash(src,11) : 0));
+ if (!slot || slot==9 || slot==13 || slot==17 || slot==21 || slot==25 || !present) { assert(!optimizedAttempt && useCode==src && calls==1); }
  else if (fail) { assert(!optimizedAttempt && useCode==src && calls==2); }
  else { assert(optimizedAttempt && useCode!=src && useWords==10 && calls==1); }
 }
-int main() { run(0,false,true); run(1,false,false); run(1,false,true); run(1,true,true); run(2,false,false); run(2,false,true); run(2,true,true); run(3,false,true); run(4,false,true); run(5,false,true); run(6,false,false); run(6,false,true); run(6,true,true); run(7,false,true); run(8,false,true); run(9,false,true); run(10,false,false); run(10,false,true); run(10,true,true); run(11,false,true); run(12,false,true); run(13,false,true); run(14,false,false); run(14,false,true); run(14,true,true); run(15,false,true); run(16,false,true); run(17,false,true); run(18,false,false); run(18,false,true); run(18,true,true); run(19,false,true); run(20,false,true); run(21,false,true); }
+int main() { run(0,false,true); run(1,false,false); run(1,false,true); run(1,true,true); run(2,false,false); run(2,false,true); run(2,true,true); run(3,false,true); run(4,false,true); run(5,false,true); run(6,false,false); run(6,false,true); run(6,true,true); run(7,false,true); run(8,false,true); run(9,false,true); run(10,false,false); run(10,false,true); run(10,true,true); run(11,false,true); run(12,false,true); run(13,false,true); run(14,false,false); run(14,false,true); run(14,true,true); run(15,false,true); run(16,false,true); run(17,false,true); run(18,false,false); run(18,false,true); run(18,true,true); run(19,false,true); run(20,false,true); run(21,false,true); run(22,false,false); run(22,false,true); run(22,true,true); run(23,false,true); run(24,false,true); run(25,false,true); }
 '''
         with tempfile.TemporaryDirectory() as d:
             cpp, exe = Path(d)/"module.cpp", Path(d)/"module"
@@ -249,6 +252,7 @@ int main() { run(0,false,true); run(1,false,false); run(1,false,true); run(1,tru
         self.assertIn("g_spvCfg.optimizedComputeHash4 && h == g_spvCfg.optimizedComputeHash4", source)
         self.assertIn("g_spvCfg.optimizedComputeHash5 && h == g_spvCfg.optimizedComputeHash5", source)
         self.assertIn("g_spvCfg.optimizedComputeHash6 && h == g_spvCfg.optimizedComputeHash6", source)
+        self.assertIn("g_spvCfg.optimizedComputeHash7 && h == g_spvCfg.optimizedComputeHash7", source)
         self.assertIn("ReadOptimizedCompute(selectedComputeHash, optimizedCode)", source)
         self.assertIn("si.optimizedComputeSourceHash = si.optimizedCompute ? selectedComputeHash : 0", source)
         self.assertIn("si.model == 5 && g_spvCfg.heavyComputeWords > 0", source)
