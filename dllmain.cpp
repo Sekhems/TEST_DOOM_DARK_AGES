@@ -31,6 +31,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
+#include "optimized_compute.h"
+#include "graphics_cap49.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <vulkan/vulkan.h>
@@ -57,6 +59,7 @@
 #include <vector>
 
 #include "vk_proxy_exports.generated.h"
+#include "rt_recovery_match.h"
 
 namespace { namespace swpx { inline bool EnsureInit(VkDevice dev); } }   // [SWRT] defined in swrt_proxy.h
 
@@ -128,6 +131,14 @@ vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferAllocateInfo* pIn
 extern "C" VKAPI_ATTR void VKAPI_CALL
 vkFreeCommandBuffers(VkDevice device, VkCommandPool pool, uint32_t count,
     const VkCommandBuffer* pBuffers);
+
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo*, uint64_t);
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(VkDevice, uint32_t, const VkFence*);
+extern "C" VKAPI_ATTR void VKAPI_CALL vkDestroyFence(VkDevice, VkFence, const VkAllocationCallbacks*);
 
 extern "C" VKAPI_ATTR void VKAPI_CALL
 vkGetDeviceBufferMemoryRequirements(VkDevice device,
@@ -202,12 +213,16 @@ namespace {
 
     // 1 = VK_EXT_extended_dynamic_state was enabled on the real device (core 1.3 vkCmdSet* are routed to it).
     volatile LONG g_edsEnabled = 0;
+    // Feature on the last successfully created device, after clamping. Never force it on.
+    volatile LONG g_graphicsCap49Feature = 0;
 
 // [v3.2] frame / submit counters for the watchdog heartbeat and the stall detector.
 volatile LONG g_presentCount = 0;
 volatile LONG g_submitCount = 0;
 volatile LONG g_lastPresentRes = 0;
 volatile LONG g_lastSubmitRes = 0;
+volatile LONG g_fenceTimeouts = 0;
+volatile LONG g_semaphoreTimeouts = 0;
 volatile LONG64 g_lastPresentTick = 0;
 volatile LONG64 g_lastSubmitTick = 0;
 
@@ -949,6 +964,11 @@ volatile LONG64 g_lastSubmitTick = 0;
 // v4: sync2 -> sync1 translation helpers
 // ---------------------------------------------------------------------------
 namespace {
+    int TraceSubmit2Begin(VkQueue queue, uint32_t count, VkFence fence);
+    void InFlightEnd(int slot);
+    void FenceTraceSubmit(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits);
+    void FenceTraceResult(VkQueue queue, VkFence fence, VkResult result);
+    void SemaphoreTraceSignals(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits, VkResult result);
     VkPipelineStageFlags ConvertStage2(VkPipelineStageFlags2 s2) {
     if (s2 == 0) return 0;
     constexpr VkPipelineStageFlags kKnown =
@@ -1003,7 +1023,18 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmits, VkFence fence) {
     auto real = RealExport<PFN_vkQueueSubmit>("vkQueueSubmit");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
-    if (submitCount == 0 || !pSubmits) return real(queue, 0, nullptr, fence);
+    if (submitCount == 0 || !pSubmits) {
+        const int slot = TraceSubmit2Begin(queue, 0, fence);
+        FenceTraceSubmit(queue, fence, 0, nullptr);
+        VkResult sr = real(queue, 0, nullptr, fence);
+        FenceTraceResult(queue, fence, sr);
+        InFlightEnd(slot);
+        InterlockedIncrement(&g_submitCount);
+        InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(sr));
+        InterlockedExchange64(&g_lastSubmitTick, static_cast<LONG64>(GetTickCount64()));
+        if (sr != VK_SUCCESS) LogLine("vkQueueSubmit2 (empty) FAILED: result=%d", (int)sr);
+        return sr;
+    }
 
     std::vector<VkSubmitInfo> si(submitCount);
     // [FIX] The old translation dropped VkSemaphoreSubmitInfo::value. Timeline semaphores then never reached the
@@ -1055,7 +1086,12 @@ vkQueueSubmit2(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2* pSubmit
         si[i].pSignalSemaphores = sigSem[i].empty() ? nullptr : sigSem[i].data();
     }
     if (FirstTime("sync2:queueSubmit2")) LogLine("SYNC2: vkQueueSubmit2 -> vkQueueSubmit (+timeline values)");
+    const int slot = TraceSubmit2Begin(queue, submitCount, fence);
+    FenceTraceSubmit(queue, fence, submitCount, si.data());
     const VkResult sr = real(queue, submitCount, si.data(), fence);
+    FenceTraceResult(queue, fence, sr);
+    SemaphoreTraceSignals(queue, fence, submitCount, si.data(), sr);
+    InFlightEnd(slot);
     // [v3.2] a lost device / failed submit used to be invisible in the log
     InterlockedIncrement(&g_submitCount);
     InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(sr));
@@ -1362,6 +1398,14 @@ static VKAPI_ATTR void VKAPI_CALL Stub_NoopCmd() {}
 static VKAPI_ATTR VkResult VKAPI_CALL Stub_ReturnSuccess() { return VK_SUCCESS; }   // [v3.2]
 // v7: SPIR-V analysis, crash tracer, driver protection
 // ---------------------------------------------------------------------------
+    // These forward declarations refer to the same handlers as the proc-address table below.
+    namespace stub {
+        VKAPI_ATTR VkResult VKAPI_CALL CreateAS(VkDevice, const VkAccelerationStructureCreateInfoKHR*,
+                                                const VkAllocationCallbacks*, VkAccelerationStructureKHR*);
+        VKAPI_ATTR void VKAPI_CALL GetASBuildSizes(VkDevice, VkAccelerationStructureBuildTypeKHR,
+            const VkAccelerationStructureBuildGeometryInfoKHR*, const uint32_t*, VkAccelerationStructureBuildSizesInfoKHR*);
+    }
+
 namespace {
     // ---- config (VulkanProxy.ini next to the dll, [spirv] section) ----------
     struct SpvConfig {
@@ -1372,6 +1416,7 @@ namespace {
         int swrtForceFeatures = 0; // [SWRT] force shaderInt64/bufferDeviceAddress/scalarBlockLayout into vkCreateDevice
         int swrtPatchBuffers = 1;  // [SWRT] strip RT usage bits from vkCreateBuffer
         int softwareRT = 1;        // [SWRT] emulate ray queries with a software BVH traversal (falls back to stripping)
+        int recoverMissingASCalls = 0; // experimental, opt-in null-call redirect for two AS functions
         int rewriteRayQuery = 1;   // strip ray queries from shaders (no-hit semantics) instead of denying them
         int dumpRewrite = 0;       // dump the first N rewritten shaders (input + output)
         int dumpRewriteFail = 3;   // dump the first N shaders the rewriter could not handle
@@ -1387,6 +1432,16 @@ namespace {
         int heavyShaderWords = 0;  // [HANGFIX] >0: shaders with more SPIR-V words than this are never sent to the driver
         int watchdog = 1;          // [HANGFIX] watchdog thread: heartbeat + in-flight report + periodic cache save
         int heavyComputeWords = 75000; // [v3.2] compute stage with >= this many SPIR-V words is never sent to the driver (0 = off)
+        int dumpHeavyCompute = 0; // opt-in: bounded dump of faked compute modules after proxy transformations
+        uint64_t optimizedComputeHash = 0; // opt-in: exact transformed module hash
+        uint64_t optimizedComputeHash2 = 0; // optional second exact hash; zero by default
+        uint64_t optimizedComputeHash3 = 0; // optional third exact hash; zero by default
+        uint64_t optimizedComputeHash4 = 0; // optional fourth exact hash; zero by default
+        uint64_t optimizedComputeHash5 = 0; // optional fifth exact hash; zero by default
+        uint64_t optimizedComputeHash6 = 0; // optional sixth exact hash; zero by default
+        uint64_t optimizedComputeHash7 = 0; // optional seventh exact hash; zero by default
+        uint64_t optimizedComputeHash8 = 0; // optional eighth exact hash; zero by default
+        uint64_t graphicsCap49VertexHash = 0, graphicsCap49FragmentHash = 0; // opt-in exact transformed hashes
         int computeTimeoutSec = 12;    // [v3.2] compute compile longer than this is abandoned (never succeeded after 3 s in the log)
         int pinStuckToOneCore = 1;     // [v3.2] abandoned (stuck) compile threads share ONE core
         int stallDumpSec = 20;         // [v3.2] no vkQueuePresentKHR for this long -> dump all thread stacks (0 = off)
@@ -1475,6 +1530,36 @@ namespace {
         g_spvCfg.heavyShaderWords = rd(L"HeavyShaderWords", 0);
         g_spvCfg.watchdog = rd(L"Watchdog", 1);
         g_spvCfg.heavyComputeWords = rd(L"HeavyComputeWords", 75000);
+        g_spvCfg.dumpHeavyCompute = (std::max)(0, (std::min)(16, rd(L"DumpHeavyCompute", 0)));
+        {
+            wchar_t hex[32]{}; wchar_t* end = nullptr;
+            GetPrivateProfileStringW(L"spirv", L"OptimizedComputeHash", L"", hex, 32, path);
+            bool valid = wcslen(hex) == 16;
+            for (size_t i = 0; valid && i < 16; ++i)
+                valid = (hex[i] >= L'0' && hex[i] <= L'9') || (hex[i] >= L'a' && hex[i] <= L'f') || (hex[i] >= L'A' && hex[i] <= L'F');
+            if (valid) {
+                const auto value = wcstoull(hex, &end, 16);
+                if (end == hex + 16) g_spvCfg.optimizedComputeHash = static_cast<uint64_t>(value);
+            }
+        }
+        auto readHash = [&](const wchar_t* key) -> uint64_t {
+            wchar_t hex[32]{}; wchar_t* end = nullptr;
+            GetPrivateProfileStringW(L"spirv", key, L"", hex, 32, path);
+            if (wcslen(hex) != 16) return 0;
+            for (size_t i = 0; i < 16; ++i)
+                if (!((hex[i] >= L'0' && hex[i] <= L'9') || (hex[i] >= L'a' && hex[i] <= L'f') || (hex[i] >= L'A' && hex[i] <= L'F'))) return 0;
+            const uint64_t v = static_cast<uint64_t>(wcstoull(hex, &end, 16));
+            return end == hex + 16 ? v : 0;
+        };
+        g_spvCfg.optimizedComputeHash2 = readHash(L"OptimizedComputeHash2");
+        g_spvCfg.optimizedComputeHash3 = readHash(L"OptimizedComputeHash3");
+        g_spvCfg.optimizedComputeHash4 = readHash(L"OptimizedComputeHash4");
+        g_spvCfg.optimizedComputeHash5 = readHash(L"OptimizedComputeHash5");
+        g_spvCfg.optimizedComputeHash6 = readHash(L"OptimizedComputeHash6");
+        g_spvCfg.optimizedComputeHash7 = readHash(L"OptimizedComputeHash7");
+        g_spvCfg.optimizedComputeHash8 = readHash(L"OptimizedComputeHash8");
+        g_spvCfg.graphicsCap49VertexHash = readHash(L"GraphicsCap49VertexHash");
+        g_spvCfg.graphicsCap49FragmentHash = readHash(L"GraphicsCap49FragmentHash");
         g_spvCfg.computeTimeoutSec = rd(L"ComputeTimeoutSec", 12);
         g_spvCfg.pinStuckToOneCore = rd(L"PinStuckThreads", 1);
         g_spvCfg.stallDumpSec = rd(L"StallDumpSec", 20);
@@ -1491,6 +1576,7 @@ namespace {
         g_spvCfg.dumpSamples = rd(L"DumpSamples", 0);
         g_spvCfg.rewriteRayQuery = rd(L"RewriteRayQuery", 1);
         g_spvCfg.softwareRT = rd(L"SoftwareRT", 1);
+        g_spvCfg.recoverMissingASCalls = rd(L"RecoverMissingASCalls", 0);
         g_spvCfg.swrtForceFeatures = rd(L"SwrtForceFeatures", 0);
         g_spvCfg.swrtPatchBuffers = rd(L"SwrtPatchBuffers", 1);
         g_spvCfg.dumpRewrite = rd(L"DumpRewrite", 0);
@@ -3574,6 +3660,9 @@ inline bool StripRayQuery(const uint32_t* in, size_t n, std::vector<uint32_t>& o
         bool denyOther = false;   // denied for a reason other than ray tracing
         bool rewritten = false;
         size_t origWords = 0;     // [SWRT] size of the ORIGINAL module (software RT makes the sent code larger)
+        bool optimizedCompute = false; // exact transformed hash selected and candidate accepted
+        uint64_t optimizedComputeSourceHash = 0;
+        uint64_t graphicsCap49Hash = 0; // nonzero only if the selected modified module reached the driver
         std::shared_ptr<std::vector<uint32_t>> code;   // final SPIR-V sent to the driver (for post-mortem dumps)
     };
     SRWLOCK g_spvLock = SRWLOCK_INIT;
@@ -3801,7 +3890,231 @@ if (si.rewritten) return std::string();
     // main thread waited for its PSO jobs -> black screen. The pipeline cache stayed at 8 KB because it was only
     // written from the present call / after a graphics pipeline, and never earlier than 120 s after the last save.
     // ======================================================================================================
-    struct InFlight { volatile LONG state; volatile LONG abandoned; DWORD tid; ULONGLONG t0; ULONGLONG lastWarn; char job[240]; };
+    // Bounded best-effort history: only dump entries for a fence whose wait is still in flight.
+    // It is diagnostic only and never queries/signals/resets a Vulkan object itself.
+    struct FenceWaitInfo { uintptr_t semaphore; uint64_t value; VkPipelineStageFlags stage; bool hasValue; };
+    struct FenceEvent {
+        uint64_t sequence; ULONGLONG tick; DWORD tid; uintptr_t fence, queue, device;
+        int kind, result; uint32_t flags, batches, commands, waits, signals, captured;
+        FenceWaitInfo wait[4];
+    };
+    constexpr size_t kFenceHistorySize = 8192;
+    FenceEvent g_fenceHistory[kFenceHistorySize]{};
+    SRWLOCK g_fenceHistoryLock = SRWLOCK_INIT;
+    uint64_t g_fenceHistorySequence = 0;
+    bool FenceTraceEnabled() { return g_spvCfgLoaded == 2 && g_spvCfg.watchdog != 0; }
+    void FenceTraceAdd(FenceEvent e) {
+        if (!e.fence || !FenceTraceEnabled()) return;
+        e.tick = GetTickCount64(); e.tid = GetCurrentThreadId();
+        AcquireSRWLockExclusive(&g_fenceHistoryLock);
+        e.sequence = ++g_fenceHistorySequence;
+        g_fenceHistory[(e.sequence - 1) % kFenceHistorySize] = e;
+        ReleaseSRWLockExclusive(&g_fenceHistoryLock);
+    }
+    // kind: 1=create, 2=reset, 3=destroy, 4=submit-enter, 5=submit-return.
+    void FenceTraceLife(VkDevice device, VkFence fence, int kind, uint32_t flags) {
+        FenceEvent e{}; e.device = (uintptr_t)device; e.fence = (uintptr_t)fence; e.kind = kind; e.flags = flags;
+        FenceTraceAdd(e);
+    }
+    void FenceTraceSubmit(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits) {
+        if (!fence || !FenceTraceEnabled()) return;
+        FenceEvent e{}; e.fence = (uintptr_t)fence; e.queue = (uintptr_t)queue; e.kind = 4; e.batches = count;
+        for (uint32_t i = 0; i < count && submits; ++i) {
+            const VkSubmitInfo& s = submits[i];
+            e.commands += s.commandBufferCount; e.waits += s.waitSemaphoreCount; e.signals += s.signalSemaphoreCount;
+            const VkTimelineSemaphoreSubmitInfo* timeline = nullptr;
+            auto p = reinterpret_cast<const VkBaseInStructure*>(s.pNext);
+            for (unsigned steps = 0; p && steps < 32; ++steps, p = p->pNext) {
+                if (p->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+                    timeline = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(p); break;
+                }
+            }
+            for (uint32_t j = 0; j < s.waitSemaphoreCount && e.captured < 4 && s.pWaitSemaphores; ++j) {
+                FenceWaitInfo& w = e.wait[e.captured++];
+                w.semaphore = (uintptr_t)s.pWaitSemaphores[j];
+                w.stage = s.pWaitDstStageMask ? s.pWaitDstStageMask[j] : 0;
+                w.hasValue = timeline && timeline->pWaitSemaphoreValues && j < timeline->waitSemaphoreValueCount;
+                w.value = w.hasValue ? timeline->pWaitSemaphoreValues[j] : 0;
+            }
+        }
+        FenceTraceAdd(e);
+    }
+    void FenceTraceResult(VkQueue queue, VkFence fence, VkResult result) {
+        FenceEvent e{}; e.fence = (uintptr_t)fence; e.queue = (uintptr_t)queue; e.kind = 5; e.result = (int)result;
+        FenceTraceAdd(e);
+    }
+    void DumpFenceHistory(VkFence fence) {
+        if (!fence) return;
+        FenceEvent found[16]{}; unsigned n = 0; uint64_t seq = 0;
+        AcquireSRWLockShared(&g_fenceHistoryLock);
+        seq = g_fenceHistorySequence;
+        for (uint64_t i = 0; i < kFenceHistorySize && i < seq && n < 16; ++i) {
+            const FenceEvent& e = g_fenceHistory[(seq - 1 - i) % kFenceHistorySize];
+            if (e.sequence && e.fence == (uintptr_t)fence) found[n++] = e;
+        }
+        ReleaseSRWLockShared(&g_fenceHistoryLock);
+        LogLine("FENCE-HISTORY fence=%p entries=%u globalEvents=%llu ringCapacity=%u (best effort, older events may be overwritten)",
+            (void*)fence, n, (unsigned long long)seq, (unsigned)kFenceHistorySize);
+        while (n) {
+            const FenceEvent& e = found[--n];
+            const char* kind = e.kind == 1 ? "create" : e.kind == 2 ? "reset" : e.kind == 3 ? "destroy" : e.kind == 4 ? "submit-enter" : "submit-return";
+            LogLine("FENCE-HISTORY seq=%llu tick=%llu thread=%lu %s device=%p queue=%p result=%d flags=0x%X batches=%u cmds=%u waits=%u signals=%u captured=%u",
+                (unsigned long long)e.sequence, (unsigned long long)e.tick, (unsigned long)e.tid, kind,
+                (void*)e.device, (void*)e.queue, e.result, e.flags, e.batches, e.commands, e.waits, e.signals, e.captured);
+            for (uint32_t j = 0; j < e.captured; ++j)
+                LogLine("FENCE-HISTORY wait[%u] semaphore=%p stage=0x%X submit_has_value=%u value=%llu (binary values ignored by driver)",
+                    j, (void*)e.wait[j].semaphore, (unsigned)e.wait[j].stage, (unsigned)e.wait[j].hasValue,
+                    (unsigned long long)e.wait[j].value);
+        }
+    }
+
+    // Best-effort CPU-side records of submit batches, including those without a
+    // fence or semaphore signal. A successful submit does not mean GPU completion.
+    struct SemaphoreSignalEvent {
+        ULONGLONG tick; DWORD tid; uintptr_t semaphore, queue, fence;
+        int result; uint32_t batch, commands, waits, signals, captured; bool hasValue; uint64_t value;
+        FenceWaitInfo wait[4];
+    };
+    constexpr size_t kSemaphoreSignalHistorySize = 32768;
+    SemaphoreSignalEvent g_semaphoreSignals[kSemaphoreSignalHistorySize]{};
+    SRWLOCK g_semaphoreSignalLock = SRWLOCK_INIT;
+    uint64_t g_semaphoreSignalSequence = 0;
+    void SemaphoreTraceSignals(VkQueue queue, VkFence fence, uint32_t count, const VkSubmitInfo* submits, VkResult result) {
+        if (!FenceTraceEnabled() || !submits) return;
+        unsigned recorded = 0;
+        for (uint32_t i = 0; i < count && recorded < 64; ++i) {
+            const VkSubmitInfo& s = submits[i];
+            const VkTimelineSemaphoreSubmitInfo* timeline = nullptr;
+            auto p = reinterpret_cast<const VkBaseInStructure*>(s.pNext);
+            for (unsigned steps = 0; p && steps < 32; ++steps, p = p->pNext) {
+                if (p->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+                    timeline = reinterpret_cast<const VkTimelineSemaphoreSubmitInfo*>(p); break;
+                }
+            }
+            SemaphoreSignalEvent base{};
+            base.tick = GetTickCount64(); base.tid = GetCurrentThreadId(); base.queue = (uintptr_t)queue;
+            base.fence = (uintptr_t)fence; base.result = (int)result; base.batch = i;
+            base.commands = s.commandBufferCount; base.waits = s.waitSemaphoreCount; base.signals = s.signalSemaphoreCount;
+            for (uint32_t j = 0; j < s.waitSemaphoreCount && base.captured < 4 && s.pWaitSemaphores; ++j) {
+                FenceWaitInfo& w = base.wait[base.captured++];
+                w.semaphore = (uintptr_t)s.pWaitSemaphores[j];
+                w.stage = s.pWaitDstStageMask ? s.pWaitDstStageMask[j] : 0;
+                w.hasValue = timeline && timeline->pWaitSemaphoreValues && j < timeline->waitSemaphoreValueCount;
+                w.value = w.hasValue ? timeline->pWaitSemaphoreValues[j] : 0;
+            }
+            AcquireSRWLockExclusive(&g_semaphoreSignalLock);
+            if (!s.signalSemaphoreCount || !s.pSignalSemaphores) {
+                g_semaphoreSignals[g_semaphoreSignalSequence++ % kSemaphoreSignalHistorySize] = base;
+                ++recorded;
+            }
+            for (uint32_t j = 0; s.pSignalSemaphores && j < s.signalSemaphoreCount && recorded < 64; ++j, ++recorded) {
+                SemaphoreSignalEvent e = base; e.semaphore = (uintptr_t)s.pSignalSemaphores[j];
+                e.hasValue = timeline && timeline->pSignalSemaphoreValues && j < timeline->signalSemaphoreValueCount;
+                e.value = e.hasValue ? timeline->pSignalSemaphoreValues[j] : 0;
+                g_semaphoreSignals[g_semaphoreSignalSequence++ % kSemaphoreSignalHistorySize] = e;
+            }
+            ReleaseSRWLockExclusive(&g_semaphoreSignalLock);
+        }
+    }
+    void DumpSemaphoreSignals(uintptr_t semaphore) {
+        if (!semaphore) return;
+        SemaphoreSignalEvent found[8]{}; unsigned n = 0; uint64_t seq;
+        AcquireSRWLockShared(&g_semaphoreSignalLock);
+        seq = g_semaphoreSignalSequence;
+        for (uint64_t i = 0; i < kSemaphoreSignalHistorySize && i < seq && n < 8; ++i) {
+            const auto& e = g_semaphoreSignals[(seq - 1 - i) % kSemaphoreSignalHistorySize];
+            if (e.semaphore == semaphore) found[n++] = e;
+        }
+        ReleaseSRWLockShared(&g_semaphoreSignalLock);
+        LogLine("SEMAPHORE-SIGNALS semaphore=%p entries=%u globalEvents=%llu (submit records only; incomplete; not GPU completion)",
+            (void*)semaphore, n, (unsigned long long)seq);
+        while (n) {
+            const auto& e = found[--n];
+            LogLine("SEMAPHORE-SIGNALS tick=%llu thread=%lu queue=%p fence=%p result=%d batch=%u cmds=%u waits=%u captured=%u submit_has_value=%u value=%llu",
+                (unsigned long long)e.tick, (unsigned long)e.tid, (void*)e.queue, (void*)e.fence, e.result,
+                e.batch, e.commands, e.waits, e.captured, (unsigned)e.hasValue, (unsigned long long)e.value);
+            for (uint32_t j = 0; j < e.captured; ++j)
+                LogLine("SEMAPHORE-SIGNALS wait[%u] semaphore=%p stage=0x%X submit_has_value=%u value=%llu",
+                    j, (void*)e.wait[j].semaphore, (unsigned)e.wait[j].stage, (unsigned)e.wait[j].hasValue,
+                    (unsigned long long)e.wait[j].value);
+        }
+    }
+    void DumpRecentSubmitDependencies() {
+        SemaphoreSignalEvent found[48]{}; unsigned n = 0; uint64_t seq;
+        AcquireSRWLockShared(&g_semaphoreSignalLock);
+        seq = g_semaphoreSignalSequence;
+        for (uint64_t i = 0; i < 48 && i < seq; ++i)
+            found[n++] = g_semaphoreSignals[(seq - 1 - i) % kSemaphoreSignalHistorySize];
+        ReleaseSRWLockShared(&g_semaphoreSignalLock);
+        LogLine("SUBMIT-RECENT entries=%u globalEvents=%llu (CPU return order; up to 64 records per call; incomplete; not GPU completion)",
+            n, (unsigned long long)seq);
+        while (n) {
+            const auto& e = found[--n];
+            LogLine("SUBMIT-RECENT tick=%llu thread=%lu queue=%p fence=%p result=%d batch=%u cmds=%u waits=%u signals=%u signal=%p submit_has_value=%u value=%llu captured_waits=%u",
+                (unsigned long long)e.tick, (unsigned long)e.tid, (void*)e.queue, (void*)e.fence,
+                e.result, e.batch, e.commands, e.waits, e.signals, (void*)e.semaphore,
+                (unsigned)e.hasValue, (unsigned long long)e.value, e.captured);
+            for (uint32_t j = 0; j < e.captured; ++j)
+                LogLine("SUBMIT-RECENT wait[%u] semaphore=%p stage=0x%X submit_has_value=%u value=%llu",
+                    j, (void*)e.wait[j].semaphore, (unsigned)e.wait[j].stage, (unsigned)e.wait[j].hasValue,
+                    (unsigned long long)e.wait[j].value);
+        }
+    }
+    void DumpFenceSignalDependencies(VkFence fence) {
+        FenceEvent latest{};
+        AcquireSRWLockShared(&g_fenceHistoryLock);
+        const uint64_t seq = g_fenceHistorySequence;
+        for (uint64_t i = 0; i < kFenceHistorySize && i < seq; ++i) {
+            const auto& e = g_fenceHistory[(seq - 1 - i) % kFenceHistorySize];
+            if (e.fence == (uintptr_t)fence && e.kind == 4) { latest = e; break; }
+        }
+        ReleaseSRWLockShared(&g_fenceHistoryLock);
+        LogLine("SEMAPHORE-SIGNALS fence=%p latest_recorded_submit_seq=%llu waits=%u captured=%u (may predate reset or miss bypassed calls)",
+            (void*)fence, (unsigned long long)latest.sequence, latest.waits, latest.captured);
+        for (uint32_t i = 0; i < latest.captured; ++i) DumpSemaphoreSignals(latest.wait[i].semaphore);
+    }
+
+    // Sample zero-timeout, single-fence polls without logging on the hot path. This
+    // is a bounded clue, not proof the last sampled fence caused the later stall.
+    struct FencePollSample { ULONGLONG tick; DWORD tid; uintptr_t device, fence; int result; };
+    constexpr size_t kFencePollSamples = 128;
+    FencePollSample g_fencePollSamples[kFencePollSamples]{};
+    SRWLOCK g_fencePollLock = SRWLOCK_INIT;
+    uint64_t g_fencePollSequence = 0;
+    void SampleFencePoll(VkDevice device, VkFence fence, VkResult result) {
+        if (!fence || !FenceTraceEnabled()) return;
+        // Each thread samples its first poll and then one in 4096, regardless of result.
+        static thread_local uint32_t count = 0;
+        if ((count++ & 4095u) != 0) return;
+        FencePollSample e{GetTickCount64(), GetCurrentThreadId(), (uintptr_t)device, (uintptr_t)fence, (int)result};
+        AcquireSRWLockExclusive(&g_fencePollLock);
+        g_fencePollSamples[g_fencePollSequence++ % kFencePollSamples] = e;
+        ReleaseSRWLockExclusive(&g_fencePollLock);
+    }
+    void DumpFencePollSamples(ULONGLONG now) {
+        FencePollSample found[8]{}; size_t n = 0; uint64_t seq = 0;
+        AcquireSRWLockShared(&g_fencePollLock);
+        seq = g_fencePollSequence;
+        for (uint64_t i = 0; i < kFencePollSamples && i < seq && n < 8; ++i) {
+            const FencePollSample& e = g_fencePollSamples[(seq - 1 - i) % kFencePollSamples];
+            bool duplicate = false;
+            for (size_t j = 0; j < n; ++j)
+                if (found[j].tid == e.tid && found[j].device == e.device && found[j].fence == e.fence) duplicate = true;
+            if (!duplicate) found[n++] = e;
+        }
+        ReleaseSRWLockShared(&g_fencePollLock);
+        LogLine("FENCE-POLL sampled zero-timeout single-fence calls: entries=%u samples=%llu (1 per 4096 per thread; stale/incomplete; not proof of cause)",
+            (unsigned)n, (unsigned long long)seq);
+        for (size_t i = 0; i < n; ++i) {
+            const FencePollSample& e = found[i];
+            LogLine("FENCE-POLL tick=%llu age_ms=%llu thread=%lu device=%p fence=%p result=%d",
+                (unsigned long long)e.tick, (unsigned long long)(now >= e.tick ? now - e.tick : 0),
+                (unsigned long)e.tid, (void*)e.device, (void*)e.fence, e.result);
+            DumpFenceHistory((VkFence)e.fence);
+        }
+    }
+
+    struct InFlight { volatile LONG state; volatile LONG abandoned; DWORD tid; ULONGLONG t0; ULONGLONG lastWarn; VkFence waitFence; char job[240]; };
     constexpr int kInFlightMax = 256;
     InFlight g_inflight[kInFlightMax];
     volatile LONG g_gateBusy = 0;
@@ -3810,13 +4123,14 @@ if (si.rewritten) return std::string();
     int g_gateSize = 0;
     namespace pcache { void MaybeSave(bool force); }
 
-    int InFlightBegin(const char* job) {
+    int InFlightBegin(const char* job, VkFence waitFence = VK_NULL_HANDLE) {
         for (int i = 0; i < kInFlightMax; ++i) {
             if (InterlockedCompareExchange(&g_inflight[i].state, 1, 0) == 0) {
                 g_inflight[i].abandoned = 0;
                 g_inflight[i].tid = GetCurrentThreadId();
                 g_inflight[i].t0 = GetTickCount64();
                 g_inflight[i].lastWarn = g_inflight[i].t0;
+                g_inflight[i].waitFence = waitFence;
                 strncpy_s(g_inflight[i].job, sizeof(g_inflight[i].job), job ? job : "", _TRUNCATE);
                 InterlockedExchange(&g_inflight[i].state, 2);
                 return i;
@@ -3825,6 +4139,27 @@ if (si.rewritten) return std::string();
         return -1;
     }
     void InFlightEnd(int i) { if (i >= 0 && i < kInFlightMax) InterlockedExchange(&g_inflight[i].state, 0); }
+    int TraceSubmit2Begin(VkQueue queue, uint32_t count, VkFence fence) {
+        if (g_spvCfgLoaded != 2 || !g_spvCfg.watchdog) return -1;
+        char job[160];
+        _snprintf_s(job, sizeof(job), _TRUNCATE, "API-WAIT vkQueueSubmit2 queue=%p batches=%u fence=%p", (void*)queue, count, (void*)fence);
+        return InFlightBegin(job);
+    }
+
+    // Observe blocking API calls without modifying their timeouts, return values or synchronization.
+    // The watchdog can report them while the game thread is still inside the driver.
+    struct ApiCallTrace {
+        int slot = -1;
+        explicit ApiCallTrace(const char* name, const char* detail = "", bool enabled = true, VkFence waitFence = VK_NULL_HANDLE) {
+            if (!enabled || g_spvCfgLoaded != 2 || !g_spvCfg.watchdog) return;
+            char job[240];
+            _snprintf_s(job, sizeof(job), _TRUNCATE, "API-WAIT %s %s", name, detail);
+            slot = InFlightBegin(job, waitFence);
+        }
+        ~ApiCallTrace() { InFlightEnd(slot); }
+        ApiCallTrace(const ApiCallTrace&) = delete;
+        ApiCallTrace& operator=(const ApiCallTrace&) = delete;
+    };
 
     void DumpAllThreads(const char* why);   // [v3.2] defined after ModuleOffset()
     DWORD WINAPI WatchdogProc(LPVOID) {
@@ -3848,6 +4183,7 @@ if (si.rewritten) return std::string();
                     LogLine("WATCHDOG: driver call still running after %llu s (thread %lu)%s: %s",
                         static_cast<unsigned long long>(age / 1000), static_cast<unsigned long>(e.tid),
                         e.abandoned ? " [ABANDONED - result is ignored]" : "", job);
+                    if (e.waitFence) { DumpFenceHistory(e.waitFence); DumpFenceSignalDependencies(e.waitFence); }
                 }
             }
             if (now - lastBeat >= 60000) {
@@ -3862,6 +4198,8 @@ if (si.rewritten) return std::string();
                     static_cast<long>(p), static_cast<long>(p - prevPresents), static_cast<long>(sb), static_cast<long>(sb - prevSubmits),
                     static_cast<long>(g_lastPresentRes), static_cast<long>(g_lastSubmitRes),
                     static_cast<unsigned long long>(lp ? (now - lp) / 1000 : 0));
+                LogLine("WAIT-STATS: fenceTimeouts=%ld semaphoreTimeouts=%ld (includes normal nonblocking polls)",
+                    static_cast<long>(g_fenceTimeouts), static_cast<long>(g_semaphoreTimeouts));
                 prevPresents = p; prevSubmits = sb;
             }
             // [v3.2] stall detector: the game stopped presenting -> show where every thread is waiting.
@@ -3873,6 +4211,8 @@ if (si.rewritten) return std::string();
                     sprintf_s(why, sizeof(why), "no vkQueuePresentKHR for %llu s (presents=%ld submits=%ld lastPresentResult=%ld lastSubmitResult=%ld)",
                         static_cast<unsigned long long>((now - lp) / 1000), static_cast<long>(g_presentCount),
                         static_cast<long>(g_submitCount), static_cast<long>(g_lastPresentRes), static_cast<long>(g_lastSubmitRes));
+                    DumpFencePollSamples(now);
+                    DumpRecentSubmitDependencies();
                     DumpAllThreads(why);
                 }
             }
@@ -4272,6 +4612,46 @@ if (si.rewritten) return std::string();
         }
     }
 
+    void DumpHeavyComputeOnce(const SpvInfo& si) {
+        if (!g_spvCfg.dumpHeavyCompute || !si.code || si.code->empty() || si.code->size() > 2u * 1024u * 1024u) return;
+        const uint64_t hash = optcompute::Hash(si.code->data(), si.code->size());
+        static SRWLOCK lock = SRWLOCK_INIT; static std::set<uint64_t> hashes;
+        bool shouldDump = false;
+        AcquireSRWLockExclusive(&lock);
+        if (hashes.size() < static_cast<size_t>(g_spvCfg.dumpHeavyCompute)) shouldDump = hashes.insert(hash).second;
+        ReleaseSRWLockExclusive(&lock);
+        if (!shouldDump) return;
+        wchar_t path[2048]{};
+        GetLogPath(path, sizeof(path) / sizeof(path[0]));
+        wchar_t* slash = wcsrchr(path, L'\\');
+        if (!slash) return;
+        const size_t off = static_cast<size_t>(slash + 1 - path);
+        if (_snwprintf_s(slash + 1, (sizeof(path) / sizeof(path[0])) - off, _TRUNCATE,
+            L"spv_heavy_%016llx_0.spv", (unsigned long long)hash) < 0) return;
+        HANDLE f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {
+            LogLine("SPIRV-OPT-SAMPLE hash=%016llx not written (already exists or file error=%lu)", (unsigned long long)hash, GetLastError());
+            return;
+        }
+        const DWORD bytes = static_cast<DWORD>(si.code->size() * sizeof(uint32_t));
+        DWORD written = 0;
+        const bool ok = WriteFile(f, si.code->data(), bytes, &written, nullptr) && written == bytes;
+        CloseHandle(f);
+        if (!ok) { DeleteFileW(path); LogLine("SPIRV-OPT-SAMPLE write failed for hash=%016llx", (unsigned long long)hash); return; }
+        LogLine("SPIRV-OPT-SAMPLE hash=%016llx originalWords=%zu finalWords=%zu path=%ls (transformed input; not proven valid)",
+            (unsigned long long)hash, si.origWords, si.code->size(), path);
+    }
+    bool ReadOptimizedCompute(uint64_t hash, std::vector<uint32_t>& out) {
+        wchar_t path[2048]{};
+        GetLogPath(path, sizeof(path) / sizeof(path[0]));
+        wchar_t* slash = wcsrchr(path, L'\\');
+        if (!slash) return false;
+        const size_t off = static_cast<size_t>(slash + 1 - path);
+        if (_snwprintf_s(slash + 1, (sizeof(path) / sizeof(path[0])) - off, _TRUNCATE,
+            L"spv_opt\\spv_%016llx.spv", (unsigned long long)hash) < 0) return false;
+        return ReadReplacement(path, out);
+    }
+
     // Post-mortem of a pipeline the driver rejected: log the interesting states and dump its shaders.
     void DescribeFailedGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, long seq) {
         LogLine("FAILED GRAPHICS PIPELINE #%ld: flags=0x%X stages=%u renderPass=%p subpass=%u", seq, (unsigned)ci.flags,
@@ -4431,6 +4811,91 @@ if (si.rewritten) return std::string();
         }
     }
 
+    // Validate complete ranges before a redirected handler dereferences them. Never change page protections.
+    bool RecoveryRange(uintptr_t ptr, size_t size, bool write) {
+        if (!ptr || !size || ptr > UINTPTR_MAX - size) return false;
+        uintptr_t end = ptr + size;
+        while (ptr < end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(ptr), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+                (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+            const DWORD p = mbi.Protect & 0xff;
+            const bool rw = p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+            const bool ro = p == PAGE_READONLY || p == PAGE_EXECUTE_READ;
+            if (write ? !rw : !(rw || ro)) return false;
+            uintptr_t base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            if (base > UINTPTR_MAX - mbi.RegionSize) return false;
+            uintptr_t next = base + mbi.RegionSize;
+            if (next <= ptr) return false;
+            ptr = next < end ? next : end;
+        }
+        return true;
+    }
+    template <class T> bool RecoveryRead(uintptr_t ptr, T& value) {
+        SIZE_T got = 0;
+        return RecoveryRange(ptr, sizeof(T), false) &&
+            ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ptr), &value, sizeof(T), &got) && got == sizeof(T);
+    }
+
+    bool TryRedirectMissingASCall(CONTEXT* c, uintptr_t ret) {
+        // Config is initialized before the device is created; never initialize it from an exception handler.
+        if (g_spvCfgLoaded != 2 || !g_spvCfg.recoverMissingASCalls || !g_rtSpoof || !g_lastDevice ||
+            c->Rcx != reinterpret_cast<uintptr_t>(g_lastDevice) || ret < 6) return false;
+        MEMORY_BASIC_INFORMATION codePage{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(ret - 1), &codePage, sizeof(codePage)) ||
+            codePage.Type != MEM_IMAGE || codePage.AllocationBase != GetModuleHandleW(nullptr)) return false;
+        unsigned char call[6]{};
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ret - 6), call, sizeof(call), &got) ||
+            got != sizeof(call) || call[0] != 0xFF || call[1] != 0x15) return false;
+        int32_t displacement = 0;
+        memcpy(&displacement, call + 2, sizeof(displacement));
+        uintptr_t slot = displacement >= 0 ? ret + static_cast<uint32_t>(displacement) : ret - static_cast<uint32_t>(-static_cast<int64_t>(displacement));
+        uintptr_t target = 1;
+        if (!RecoveryRead(slot, target) || target != 0) return false;
+
+        rt_recovery::Evidence e{};
+        e.enabled = e.spoof = e.sameDevice = e.gameCallIndirectNull = true;
+        e.arg2 = c->Rdx;
+        if (c->Rdx == VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR) {
+            VkAccelerationStructureBuildGeometryInfoKHR input{};
+            VkAccelerationStructureBuildSizesInfoKHR output{};
+            uintptr_t out = 0;
+            if (c->Rsp > UINTPTR_MAX - 0x28 || !RecoveryRead(c->Rsp + 0x28, out) ||
+                !RecoveryRead(c->R8, input) || !RecoveryRead(out, output)) return false;
+            e.inputType = static_cast<uint32_t>(input.sType);
+            e.outputType = static_cast<uint32_t>(output.sType);
+            e.argumentsReadable = true;
+            e.outputWritable = RecoveryRange(out, sizeof(output), true);
+            e.validPayload = input.geometryCount <= 65536 &&
+                (!input.geometryCount || RecoveryRange(c->R9, size_t(input.geometryCount) * sizeof(uint32_t), false));
+        } else {
+            VkAccelerationStructureCreateInfoKHR input{};
+            if (c->R8 != 0 || !RecoveryRead(c->Rdx, input)) return false;
+            e.inputType = static_cast<uint32_t>(input.sType);
+            e.outputType = 0;
+            e.argumentsReadable = true;
+            e.outputWritable = RecoveryRange(c->R9, sizeof(VkAccelerationStructureKHR), true);
+            e.validPayload = input.buffer != VK_NULL_HANDLE && input.size != 0;
+        }
+        const rt_recovery::Target kind = rt_recovery::Classify(e);
+        if (kind == rt_recovery::Target::BuildSizes) {
+            c->Rip = reinterpret_cast<uintptr_t>(&stub::GetASBuildSizes);
+            static volatile LONG count = 0;
+            LONG n = InterlockedIncrement(&count);
+            if (n <= 20 || n % 500 == 0) LogLine("!!! EXEC@0 redirected to proxy vkGetAccelerationStructureBuildSizesKHR (experimental, count=%ld)", (long)n);
+            return true;
+        }
+        if (kind == rt_recovery::Target::CreateAS) {
+            c->Rip = reinterpret_cast<uintptr_t>(&stub::CreateAS);
+            static volatile LONG count = 0;
+            LONG n = InterlockedIncrement(&count);
+            if (n <= 20 || n % 500 == 0) LogLine("!!! EXEC@0 redirected to proxy vkCreateAccelerationStructureKHR (experimental, count=%ld)", (long)n);
+            return true;
+        }
+        return false;
+    }
+
     void ReportCrash(PEXCEPTION_POINTERS ep);
     LONG CALLBACK CrashHandler(PEXCEPTION_POINTERS ep) {
         if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -4472,8 +4937,41 @@ if (si.rewritten) return std::string();
             __try {
                 const ULONG64 ret = *reinterpret_cast<ULONG64*>(ep->ContextRecord->Rsp);
                 if (ret > 0x10000ull) {
+                    if (TryRedirectMissingASCall(ep->ContextRecord, static_cast<uintptr_t>(ret)))
+                        return EXCEPTION_CONTINUE_EXECUTION;
                     char caller[300]; ModuleOffset((void*)ret, caller, sizeof(caller));
-                LogLine("!!! EXEC@0 skipped null call, caller=%s", caller);
+                    LogLine("!!! EXEC@0 skipped null call, caller=%s", caller);
+                    // Capture call-site bytes and argument registers without guessing the signature.
+                    // Never dereference the argument pointers in the exception handler.
+                    static volatile LONG nullCallDetails = 0;
+                    if (InterlockedIncrement(&nullCallDetails) <= 20) {
+                        const CONTEXT* c = ep->ContextRecord;
+                        LogLine("!!! EXEC@0 args: RCX=%016llX RDX=%016llX R8=%016llX R9=%016llX RAX=%016llX",
+                            (unsigned long long)c->Rcx, (unsigned long long)c->Rdx,
+                            (unsigned long long)c->R8, (unsigned long long)c->R9, (unsigned long long)c->Rax);
+                        LogLine("!!! EXEC@0 regs: RBX=%016llX RSI=%016llX RDI=%016llX R10=%016llX R11=%016llX",
+                            (unsigned long long)c->Rbx, (unsigned long long)c->Rsi, (unsigned long long)c->Rdi,
+                            (unsigned long long)c->R10, (unsigned long long)c->R11);
+                        unsigned char code[32]{};
+                        SIZE_T read = 0;
+                        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(ret - sizeof(code)),
+                                              code, sizeof(code), &read) && read == sizeof(code)) {
+                            LogLine("!!! EXEC@0 caller bytes [return-32, return-16): %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                                code[0], code[1], code[2], code[3], code[4], code[5], code[6], code[7],
+                                code[8], code[9], code[10], code[11], code[12], code[13], code[14], code[15]);
+                            LogLine("!!! EXEC@0 caller bytes [return-16, return): %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                                code[16], code[17], code[18], code[19], code[20], code[21], code[22], code[23],
+                                code[24], code[25], code[26], code[27], code[28], code[29], code[30], code[31]);
+                        } else {
+                            LogLine("!!! EXEC@0 caller bytes unavailable");
+                        }
+                        // First stack-passed x64 argument, if present; its value is not dereferenced.
+                        ULONG64 arg5 = 0;
+                        read = 0;
+                        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(c->Rsp + 0x28),
+                                              &arg5, sizeof(arg5), &read) && read == sizeof(arg5))
+                            LogLine("!!! EXEC@0 stack slot [RSP+0x28]=%016llX (fifth argument if present)", (unsigned long long)arg5);
+                    }
                     ep->ContextRecord->Rip = ret;
                     ep->ContextRecord->Rsp += 8;  // pop return address
                     ep->ContextRecord->Rax = 0;   // return VK_SUCCESS / nullptr
@@ -5122,6 +5620,46 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
 }
 
 
+    // Up to eight explicitly selected hashes, never a general relaxation of the safety limit.
+    const uint32_t* baselineCode = useCode;
+    const size_t baselineWords = useWords;
+    std::vector<uint32_t> optimizedCode;
+    bool optimizedAttempt = false;
+    uint64_t selectedComputeHash = 0;
+    if (si.model == 5 && g_spvCfg.heavyComputeWords > 0 && si.origWords >= static_cast<size_t>(g_spvCfg.heavyComputeWords)
+        && (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4 || g_spvCfg.optimizedComputeHash5 || g_spvCfg.optimizedComputeHash6 || g_spvCfg.optimizedComputeHash7 || g_spvCfg.optimizedComputeHash8)) {
+        const uint64_t h = optcompute::Hash(useCode, useWords);
+        if ((g_spvCfg.optimizedComputeHash && h == g_spvCfg.optimizedComputeHash) ||
+            (g_spvCfg.optimizedComputeHash2 && h == g_spvCfg.optimizedComputeHash2) ||
+            (g_spvCfg.optimizedComputeHash3 && h == g_spvCfg.optimizedComputeHash3) ||
+            (g_spvCfg.optimizedComputeHash4 && h == g_spvCfg.optimizedComputeHash4) ||
+            (g_spvCfg.optimizedComputeHash5 && h == g_spvCfg.optimizedComputeHash5) ||
+            (g_spvCfg.optimizedComputeHash6 && h == g_spvCfg.optimizedComputeHash6) ||
+            (g_spvCfg.optimizedComputeHash7 && h == g_spvCfg.optimizedComputeHash7) ||
+            (g_spvCfg.optimizedComputeHash8 && h == g_spvCfg.optimizedComputeHash8)) selectedComputeHash = h;
+    }
+    if (selectedComputeHash) {
+        if (ReadOptimizedCompute(selectedComputeHash, optimizedCode) &&
+            optcompute::Accept(useCode, useWords, optimizedCode.data(), optimizedCode.size(), static_cast<size_t>(g_spvCfg.heavyComputeWords))) {
+            optimizedAttempt = true; useCode = optimizedCode.data(); useWords = optimizedCode.size();
+            LogLine("SPIRV-OPT: testing selected hash=%016llx finalWords=%zu -> %zu (GPU safety not established)",
+                (unsigned long long)selectedComputeHash, baselineWords, useWords);
+        } else LogLine("SPIRV-OPT: selected hash=%016llx candidate missing or rejected; using original guard", (unsigned long long)selectedComputeHash);
+    }
+    // One explicitly selected vertex and fragment module only. This does not change compute hashes.
+    const uint64_t graphicsHash = si.model == 0 ? g_spvCfg.graphicsCap49VertexHash :
+                                  si.model == 4 ? g_spvCfg.graphicsCap49FragmentHash : 0;
+    std::vector<uint32_t> graphicsCapCode;
+    bool graphicsAttempt = false;
+    if (graphicsHash && optcompute::Hash(useCode, useWords) == graphicsHash) {
+        const bool enabled = device == g_lastDevice && InterlockedCompareExchange(&g_graphicsCap49Feature, 0, 0) != 0;
+        if (graphicscap49::AddForSelectedModule(useCode, useWords, si.model, graphicsHash, enabled, graphicsCapCode)) {
+            graphicsAttempt = true; useCode = graphicsCapCode.data(); useWords = graphicsCapCode.size();
+            LogLine("GRAPHICS-CAP49: testing selected model=%u hash=%016llx words=%zu (experimental)", si.model,
+                (unsigned long long)graphicsHash, useWords);
+        } else LogLine("GRAPHICS-CAP49: selected model=%u hash=%016llx not applied (feature disabled or module rejected)",
+            si.model, (unsigned long long)graphicsHash);
+    }
     ci.pCode = useCode;
     ci.codeSize = useWords * 4;
     Crumb("vkCreateShaderModule #%ld caps=[%s]", n, si.caps.c_str());
@@ -5132,6 +5670,18 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         LogLine("CAUGHT driver crash in vkCreateShaderModule #%ld (spv=%x size=%zu caps=[%s])", n, si.version, pInfo->codeSize, si.caps.c_str());
         DumpSpirv("crash", n, useCode, useWords * 4);
         r = VK_ERROR_UNKNOWN;
+    }
+    if (optimizedAttempt && r != VK_SUCCESS) {
+        LogLine("SPIRV-OPT: candidate shader module failed; retrying baseline with original guard");
+        optimizedAttempt = false; useCode = baselineCode; useWords = baselineWords;
+        ci.pCode = useCode; ci.codeSize = useWords * 4; r = VK_ERROR_UNKNOWN;
+        if (!DriverCall([&]() { r = real(device, &ci, pAllocator, pShaderModule); })) r = VK_ERROR_UNKNOWN;
+    }
+    if (graphicsAttempt && r != VK_SUCCESS) {
+        LogLine("GRAPHICS-CAP49: shader module failed; retrying baseline");
+        graphicsAttempt = false; useCode = baselineCode; useWords = baselineWords;
+        ci.pCode = useCode; ci.codeSize = useWords * 4; r = VK_ERROR_UNKNOWN;
+        if (!DriverCall([&]() { r = real(device, &ci, pAllocator, pShaderModule); })) r = VK_ERROR_UNKNOWN;
     }
     // The old driver's SPIR-V front end crashes on some constructs (e.g. OpConvertUToPtr). Try equivalent
     // rewrites of the module before giving up on it.
@@ -5164,6 +5714,9 @@ if (g_spvCfg.lowerFp16AndInt16 && (si.caps.find("Float16") != std::string::npos 
         PutSpvInfo(*pShaderModule, si);
         return VK_SUCCESS;
     }
+    si.optimizedCompute = optimizedAttempt && variantCode.empty();
+    si.optimizedComputeSourceHash = si.optimizedCompute ? selectedComputeHash : 0;
+    si.graphicsCap49Hash = graphicsAttempt && variantCode.empty() ? graphicsHash : 0;
     if (g_spvCfg.keepCode) {
         if (!variantCode.empty()) si.code = std::make_shared<std::vector<uint32_t>>(variantCode);
         else si.code = std::make_shared<std::vector<uint32_t>>(useCode, useCode + useWords);
@@ -5178,6 +5731,9 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
 
     LoadSpvConfig();
+    char presentDetail[96];
+    _snprintf_s(presentDetail, sizeof(presentDetail), _TRUNCATE, "queue=%p", (void*)queue);
+    ApiCallTrace trace("vkQueuePresentKHR", presentDetail);
     VkPresentInfoKHR modifiedPresent{};
     const VkPresentInfoKHR* usePresent = pPresentInfo;
     VkSemaphore postSem = VK_NULL_HANDLE;
@@ -5503,25 +6059,32 @@ vkBindImageMemory2(VkDevice device, uint32_t bindCount, const VkBindImageMemoryI
     return r;
 }
 
+// Use the same effective usage flags for actual creation and maintenance4 queries.
+static bool PatchSwrtBufferCreateInfo(const VkBufferCreateInfo& source, VkBufferCreateInfo& patched) {
+    constexpr VkBufferUsageFlags kRtBits = 0x00080000 | 0x00100000 | 0x00000400;
+    LoadSpvConfig();
+    if (!g_spvCfg.softwareRT || !g_spvCfg.swrtPatchBuffers || !swpx::Ready() || !(source.usage & kRtBits)) return false;
+    patched = source;
+    patched.usage = (source.usage & ~kRtBits) | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    return true;
+}
+
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkCreateBuffer(VkDevice device, const VkBufferCreateInfo* pInfo,
     const VkAllocationCallbacks* pAllocator, VkBuffer* pBuffer) {
     auto real = RealExport<PFN_vkCreateBuffer>("vkCreateBuffer");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
-    // [SWRT] Strip RT-only usage bits the driver does not know; AS / SBT / build-input buffers become plain device-address
-    // storage buffers (our BVH builder reads and writes them from compute shaders through their device address).
     VkBufferCreateInfo patched{};
-    if (pInfo) {
-        constexpr VkBufferUsageFlags kRtBits = 0x00080000 /*AS_BUILD_INPUT_READ_ONLY*/ | 0x00100000 /*AS_STORAGE*/ | 0x00000400 /*SHADER_BINDING_TABLE*/;
-        LoadSpvConfig();
-        if (g_spvCfg.softwareRT && g_spvCfg.swrtPatchBuffers && swpx::Ready() && (pInfo->usage & kRtBits)) {
-            patched = *pInfo;
-            patched.usage = (pInfo->usage & ~kRtBits) | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            static volatile LONG n = 0;
-            if (InterlockedIncrement(&n) <= 8) LogLine("SWRT: vkCreateBuffer RT usage 0x%X -> 0x%X (size=%llu)", (unsigned)pInfo->usage, (unsigned)patched.usage, (unsigned long long)pInfo->size);
-            pInfo = &patched;
-        }
+    if (pInfo && PatchSwrtBufferCreateInfo(*pInfo, patched)) {
+        static volatile LONG n = 0;
+        if (InterlockedIncrement(&n) <= 8) LogLine("SWRT: vkCreateBuffer RT usage 0x%X -> 0x%X (size=%llu)", (unsigned)pInfo->usage, (unsigned)patched.usage, (unsigned long long)pInfo->size);
+        pInfo = &patched;
+    }
+    if (pInfo && pInfo->size == 0) {
+        static volatile LONG zeroCount = 0;
+        if (InterlockedIncrement(&zeroCount) <= 20)
+            LogLine("!!! vkCreateBuffer called with size=0, usage=0x%X (invalid Vulkan create info; check preceding EXEC@0)", (unsigned)pInfo->usage);
     }
     VkResult r = real(device, pInfo, pAllocator, pBuffer);
     if (r != VK_SUCCESS) {
@@ -5803,7 +6366,24 @@ vkCreateFence(VkDevice device, const VkFenceCreateInfo* pInfo,
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult r = real(device, pInfo, pAllocator, pFence);
     if (r != VK_SUCCESS) LogLine("vkCreateFence FAILED: result=%d", (int)r);
+    else if (pFence && *pFence) FenceTraceLife(device, *pFence, 1, pInfo ? (uint32_t)pInfo->flags : 0);
     return r;
+}
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL
+vkResetFences(VkDevice device, uint32_t count, const VkFence* fences) {
+    auto real = RealExport<PFN_vkResetFences>("vkResetFences");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult r = real(device, count, fences);
+    if (r == VK_SUCCESS && fences) for (uint32_t i = 0; i < count; ++i) FenceTraceLife(device, fences[i], 2, 0);
+    if (r != VK_SUCCESS) LogLine("vkResetFences FAILED: result=%d", (int)r);
+    return r;
+}
+extern "C" VKAPI_ATTR void VKAPI_CALL
+vkDestroyFence(VkDevice device, VkFence fence, const VkAllocationCallbacks* allocator) {
+    auto real = RealExport<PFN_vkDestroyFence>("vkDestroyFence");
+    if (!real) return;
+    FenceTraceLife(device, fence, 3, 0);
+    real(device, fence, allocator);
 }
 
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
@@ -5948,6 +6528,12 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
         // Always-active: dynamic rendering emulation, memory-requirements stubs,
         // and the pipeline bind/destroy hooks (which used to be RT-only).
         const Entry kAlwaysTable[] = {
+            VKSTUB("vkQueueSubmit", vkQueueSubmit),
+            VKSTUB("vkQueueWaitIdle", vkQueueWaitIdle),
+            VKSTUB("vkDeviceWaitIdle", vkDeviceWaitIdle),
+            VKSTUB("vkWaitForFences", vkWaitForFences),
+            VKSTUB("vkWaitSemaphores", vkWaitSemaphores),
+            VKSTUB("vkWaitSemaphoresKHR", vkWaitSemaphores),
             VKSTUB("vkCreateGraphicsPipelines", vkCreateGraphicsPipelines),
 			VKSTUB("vkCreateComputePipelines",  vkCreateComputePipelines),
             VKSTUB("vkDestroyPipeline",         vkDestroyPipeline),
@@ -5973,8 +6559,11 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
             VKSTUB("vkAllocateCommandBuffers",  vkAllocateCommandBuffers),
             VKSTUB("vkFreeCommandBuffers",      vkFreeCommandBuffers),
             VKSTUB("vkGetDeviceBufferMemoryRequirements",         vkGetDeviceBufferMemoryRequirements),
+            VKSTUB("vkGetDeviceBufferMemoryRequirementsKHR", vkGetDeviceBufferMemoryRequirements),
             VKSTUB("vkGetDeviceImageMemoryRequirements",          vkGetDeviceImageMemoryRequirements),
+            VKSTUB("vkGetDeviceImageMemoryRequirementsKHR", vkGetDeviceImageMemoryRequirements),
             VKSTUB("vkGetDeviceImageSparseMemoryRequirements",    vkGetDeviceImageSparseMemoryRequirements),
+            VKSTUB("vkGetDeviceImageSparseMemoryRequirementsKHR", vkGetDeviceImageSparseMemoryRequirements),
 			            // v4: sync2 stubs (always active - translate to sync1)
             VKSTUB("vkQueueSubmit2",           vkQueueSubmit2),
             VKSTUB("vkQueueSubmit2KHR",        vkQueueSubmit2KHR),
@@ -6026,6 +6615,8 @@ vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo* pInfo,
             VKSTUB("vkUpdateDescriptorSets",     vkUpdateDescriptorSets),
             VKSTUB("vkCreateCommandPool",        vkCreateCommandPool),
             VKSTUB("vkCreateFence",              vkCreateFence),
+            VKSTUB("vkResetFences",              vkResetFences),
+            VKSTUB("vkDestroyFence",            vkDestroyFence),
             VKSTUB("vkCreateRenderPass",         vkCreateRenderPass),
 			
         };
@@ -6259,6 +6850,21 @@ vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count
         auto modsP = std::make_shared<std::vector<VkGraphicsPipelineCreateInfo>>(mods);
         bool timedOut = false;
         const bool callOk = DriverCallTimed([=]() { *resP = real(device, cache, count, modsP->data(), pAllocator, outP->data()); }, timedOut);
+        if (g_spvCfg.graphicsCap49VertexHash || g_spvCfg.graphicsCap49FragmentHash) {
+            for (uint32_t i = 0; i < count; ++i) {
+                for (uint32_t j = 0; pCreateInfos[i].pStages && j < pCreateInfos[i].stageCount; ++j) {
+                    SpvInfo tracked;
+                    if (!GetSpvInfo(pCreateInfos[i].pStages[j].module, tracked) || !tracked.graphicsCap49Hash) continue;
+                    static volatile LONG capOutcome = 0;
+                    if (InterlockedIncrement(&capOutcome) <= 40) {
+                        if (callOk) LogLine("GRAPHICS-CAP49: pipeline result=%d index=%u/%u model=%u hash=%016llx output=%p (GPU execution not established)",
+                            (int)*resP, i, count, tracked.model, (unsigned long long)tracked.graphicsCap49Hash, (void*)(*outP)[i]);
+                        else LogLine("GRAPHICS-CAP49: pipeline driver call %s model=%u hash=%016llx -> FAKE",
+                            timedOut ? "TIMED OUT" : "failed or crashed", tracked.model, (unsigned long long)tracked.graphicsCap49Hash);
+                    }
+                }
+            }
+        }
         if (callOk) {
             r = *resP;
             if (pPipelines) for (uint32_t i = 0; i < count; ++i) pPipelines[i] = (*outP)[i];
@@ -6392,6 +6998,9 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
         for (uint32_t i = 0; i < createInfoCount; ++i) {
             const char* why = nullptr;
             if (PipelineQuarantined(&pCreateInfos[i].stage, 1, &why)) {
+                SpvInfo si;
+                if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4 || g_spvCfg.optimizedComputeHash5 || g_spvCfg.optimizedComputeHash6 || g_spvCfg.optimizedComputeHash7 || g_spvCfg.optimizedComputeHash8) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                    LogLine("SPIRV-OPT: selected pipeline blocked by quarantine (%s)", why ? why : "?");
                 q[i] = 1; anyQ = true;
                 static volatile LONG qn = 0;
                 const LONG t = InterlockedIncrement(&qn);
@@ -6422,7 +7031,12 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             SpvInfo hsi;
             size_t words = 0;
             if (GetSpvInfo(pCreateInfos[i].stage.module, hsi) && hsi.code) words = hsi.origWords ? hsi.origWords : hsi.code->size();   // [SWRT] compare the original size
-            if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords)) {
+            const bool admit = hsi.optimizedCompute && hsi.code && hsi.code->size() < static_cast<size_t>(g_spvCfg.heavyComputeWords);
+            if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords) && admit)
+                LogLine("SPIRV-OPT: allowing selected compute pipeline originalWords=%zu optimizedWords=%zu hash=%016llx (experimental)",
+                    words, hsi.code->size(), (unsigned long long)hsi.optimizedComputeSourceHash);
+            if (words >= static_cast<size_t>(g_spvCfg.heavyComputeWords) && !admit) {
+                DumpHeavyComputeOnce(hsi);
                 heavy[i] = 1; anyHeavy = true;
                 static volatile LONG heavyC = 0;
                 const LONG hc = InterlockedIncrement(&heavyC);
@@ -6461,6 +7075,9 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             std::vector<uint32_t> subIdx;
             for (uint32_t i = 0; i < createInfoCount; ++i) {
                 if (toxic[i]) {
+                    SpvInfo si;
+                    if ((g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4 || g_spvCfg.optimizedComputeHash5 || g_spvCfg.optimizedComputeHash6 || g_spvCfg.optimizedComputeHash7 || g_spvCfg.optimizedComputeHash8) && GetSpvInfo(pCreateInfos[i].stage.module, si) && si.optimizedCompute)
+                        LogLine("SPIRV-OPT: selected pipeline blocked by toxic signature");
                     if (pPipelines) pPipelines[i] = MakeFake<VkPipeline>();
                     LONG t = InterlockedIncrement(&toxC);
                     if (t <= 10 || t % 50 == 0)
@@ -6506,6 +7123,24 @@ vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache, uint32_
             if (cr == VK_SUCCESS) pcache::Dirty();
         }
     }
+    // The earlier "allowing" line only means the size gate admitted the module.
+    // Log the actual driver outcome for this module; other calls may run concurrently.
+    if (g_spvCfg.optimizedComputeHash || g_spvCfg.optimizedComputeHash2 || g_spvCfg.optimizedComputeHash3 || g_spvCfg.optimizedComputeHash4 || g_spvCfg.optimizedComputeHash5 || g_spvCfg.optimizedComputeHash6 || g_spvCfg.optimizedComputeHash7 || g_spvCfg.optimizedComputeHash8) {
+        for (uint32_t i = 0; i < createInfoCount; ++i) {
+            SpvInfo si;
+            if (!GetSpvInfo(pCreateInfos[i].stage.module, si) || !si.optimizedCompute) continue;
+            static volatile LONG optOutcomeCount = 0;
+            if (InterlockedIncrement(&optOutcomeCount) <= 40) {
+                if (!cCallOk)
+                    LogLine("SPIRV-OPT: selected pipeline driver call %s hash=%016llx -> FAKE", cTimedOut ? "TIMED OUT" : "failed or crashed",
+                        (unsigned long long)si.optimizedComputeSourceHash);
+                else
+                    LogLine("SPIRV-OPT: selected pipeline driver result=%d index=%u/%u hash=%016llx output=%p%s", (int)cr, i, createInfoCount,
+                        (unsigned long long)si.optimizedComputeSourceHash, pPipelines ? (void*)pPipelines[i] : nullptr,
+                        cr == VK_SUCCESS ? " (GPU execution not established)" : " -> FAKE");
+            }
+        }
+    }
     if (!cCallOk) {
         if (cTimedOut) {
             LogLine("vkCreateComputePipelines TIMED OUT (count=%u) -> FAKE pipelines", createInfoCount);
@@ -6543,14 +7178,26 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueSubmit(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
     auto real = RealExport<PFN_vkQueueSubmit>("vkQueueSubmit");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[128];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "queue=%p batches=%u fence=%p", (void*)queue, submitCount, (void*)fence);
+    ApiCallTrace trace("vkQueueSubmit", detail);
+    FenceTraceSubmit(queue, fence, submitCount, pSubmits);
     VkResult r = real(queue, submitCount, pSubmits, fence);
-    if (r != VK_SUCCESS) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkQueueSubmit FAILED: result=%d (submits=%u)", (int)r, submitCount); }
+    FenceTraceResult(queue, fence, r);
+    SemaphoreTraceSignals(queue, fence, submitCount, pSubmits, r);
+    InterlockedIncrement(&g_submitCount);
+    InterlockedExchange(&g_lastSubmitRes, static_cast<LONG>(r));
+    InterlockedExchange64(&g_lastSubmitTick, static_cast<LONG64>(GetTickCount64()));
+    if (r != VK_SUCCESS) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkQueueSubmit FAILED: result=%d (submits=%u)%s", (int)r, submitCount, r == VK_ERROR_DEVICE_LOST ? " VK_ERROR_DEVICE_LOST" : ""); }
     return r;
 }
 extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueWaitIdle(VkQueue queue) {
     auto real = RealExport<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[96];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "queue=%p", (void*)queue);
+    ApiCallTrace trace("vkQueueWaitIdle", detail);
     VkResult r = real(queue);
     if (r != VK_SUCCESS) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkQueueWaitIdle FAILED: result=%d", (int)r); }
     return r;
@@ -6559,8 +7206,46 @@ extern "C" VKAPI_ATTR VkResult VKAPI_CALL
 vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkFence* pFences, VkBool32 waitAll, uint64_t timeout) {
     auto real = RealExport<PFN_vkWaitForFences>("vkWaitForFences");
     if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[160]{};
+    if (timeout != 0)
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p all=%u timeout_ns=%llu",
+            (void*)device, fenceCount, (void*)(fenceCount && pFences ? pFences[0] : VK_NULL_HANDLE), (unsigned)waitAll,
+            (unsigned long long)timeout);
+    ApiCallTrace trace("vkWaitForFences", detail, timeout != 0,
+                       timeout != 0 && fenceCount == 1 && pFences ? pFences[0] : VK_NULL_HANDLE);
     VkResult r = real(device, fenceCount, pFences, waitAll, timeout);
+    if (r == VK_TIMEOUT) InterlockedIncrement(&g_fenceTimeouts);
+    if (timeout == 0 && fenceCount == 1 && pFences) SampleFencePoll(device, pFences[0], r);
     if (r != VK_SUCCESS && r != VK_TIMEOUT) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkWaitForFences FAILED: result=%d", (int)r); }
+    return r;
+}
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL
+vkDeviceWaitIdle(VkDevice device) {
+    auto real = RealExport<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[96];
+    _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p", (void*)device);
+    ApiCallTrace trace("vkDeviceWaitIdle", detail);
+    VkResult r = real(device);
+    if (r != VK_SUCCESS) LogLine("vkDeviceWaitIdle FAILED: result=%d", (int)r);
+    return r;
+}
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL
+vkWaitSemaphores(VkDevice device, const VkSemaphoreWaitInfo* info, uint64_t timeout) {
+    auto real = RealExport<PFN_vkWaitSemaphores>("vkWaitSemaphores");
+    if (!real) return VK_ERROR_INITIALIZATION_FAILED;
+    char detail[160]{};
+    if (timeout != 0) {
+        const bool first = info && info->semaphoreCount && info->pSemaphores && info->pValues;
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE, "device=%p count=%u first=%p value=%llu flags=0x%X timeout_ns=%llu",
+            (void*)device, info ? info->semaphoreCount : 0, (void*)(first ? info->pSemaphores[0] : VK_NULL_HANDLE),
+            first ? (unsigned long long)info->pValues[0] : 0ull, info ? (unsigned)info->flags : 0,
+            (unsigned long long)timeout);
+    }
+    ApiCallTrace trace("vkWaitSemaphores", detail, timeout != 0);
+    VkResult r = real(device, info, timeout);
+    if (r == VK_TIMEOUT) InterlockedIncrement(&g_semaphoreTimeouts);
+    if (r != VK_SUCCESS && r != VK_TIMEOUT) { static volatile LONG n = 0; if (InterlockedIncrement(&n) <= 20) LogLine("vkWaitSemaphores FAILED: result=%d", (int)r); }
     return r;
 }
 
@@ -7013,9 +7698,23 @@ vkGetDeviceBufferMemoryRequirements(VkDevice device, const VkDeviceBufferMemoryR
     auto destroy = RealExport<PFN_vkDestroyBuffer>("vkDestroyBuffer");
     if (!create || !getReq || !destroy) return;
     VkBuffer tmp = VK_NULL_HANDLE;
-    VkResult r = create(device, pInfo->pCreateInfo, nullptr, &tmp);
+    VkBufferCreateInfo patched{};
+    const VkBufferCreateInfo* ci = pInfo->pCreateInfo;
+    if (PatchSwrtBufferCreateInfo(*ci, patched)) ci = &patched;
+    VkResult r = create(device, ci, nullptr, &tmp);
     if (r == VK_SUCCESS && tmp) {
-        getReq(device, tmp, &pMemoryRequirements->memoryRequirements);
+        // Preserve output pNext, including dedicated allocation requirements.
+        auto getReq2 = RealExport<PFN_vkGetBufferMemoryRequirements2>("vkGetBufferMemoryRequirements2");
+        if (getReq2) {
+            VkBufferMemoryRequirementsInfo2 ri{};
+            ri.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2;
+            ri.buffer = tmp;
+            getReq2(device, &ri, pMemoryRequirements);
+        } else {
+            getReq(device, tmp, &pMemoryRequirements->memoryRequirements);
+            if (pMemoryRequirements->pNext && FirstTime("maintenance4:buffer-output-pnext"))
+                LogLine("!!! maintenance4 buffer requirements: output pNext unavailable on this driver");
+        }
         destroy(device, tmp, nullptr);
     } else {
         LogLine("dynrend: temp vkCreateBuffer for memory reqs failed result=%d", static_cast<int>(r));
@@ -7410,6 +8109,10 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
     }
     // [SWRT] BVH builder kernels need 64-bit ints, buffer device address and scalar block layout.
     LoadSpvConfig();
+    if (g_spvCfg.watchdog)
+        LogLine("API-WAIT: watchdog tracking active for submit, present, fence, semaphore and idle calls; FENCE-HISTORY ring=8192");
+    if (g_spvCfg.recoverMissingASCalls)
+        LogLine("AS recovery: experimental null-call redirect enabled");
     if (g_spvCfg.softwareRT && g_spvCfg.swrtForceFeatures) {
         bool got12 = false;
         for (VkBaseOutStructure* n = const_cast<VkBaseOutStructure*>(reinterpret_cast<const VkBaseOutStructure*>(ci.pNext)); n; n = n->pNext) {
@@ -7423,6 +8126,16 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
         if (ci.pEnabledFeatures) localCore.shaderInt64 = VK_TRUE;
         if (!got12) LogLine("SWRT: no Vulkan12Features in the device chain - BVH builder may be unavailable");
     }
+    // Record the value actually passed to the driver, not just its advertised support.
+    // Absence of this line means the core Vulkan 1.2 feature struct was not present;
+    // it does not rule out the separate extension feature struct.
+    for (const VkBaseInStructure* n = reinterpret_cast<const VkBaseInStructure*>(ci.pNext); n; n = n->pNext) {
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) {
+            auto* f = reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(n);
+            LogLine("SCALAR-LAYOUT: sanitized Vulkan12Features.scalarBlockLayout=%u (see vkCreateDevice result)", f->scalarBlockLayout);
+            break;
+        }
+    }
     VkResult r = real(pd, &ci, pAllocator, pDevice);
     if (r != VK_SUCCESS && edsAdded) {
         // The driver refused the extra extension: retry exactly as the game asked.
@@ -7435,6 +8148,21 @@ vkCreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* pCreateInfo,
         r = real(pd, &ci, pAllocator, pDevice);
     }
     if (r == VK_SUCCESS && edsAvail) InterlockedExchange(&g_edsEnabled, 1);
+
+    // Examine the actual sanitized core features passed to the successful driver call,
+    // before restoring the application's pNext chain. Do not enable any new feature.
+    bool cap49Enabled = ci.pEnabledFeatures && ci.pEnabledFeatures->shaderStorageImageExtendedFormats;
+    bool hasFeature2 = false;
+    unsigned capGuard = 0;
+    for (const VkBaseInStructure* n = reinterpret_cast<const VkBaseInStructure*>(ci.pNext); n && capGuard++ < 128; n = n->pNext) {
+        if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2) {
+            hasFeature2 = true;
+            cap49Enabled = reinterpret_cast<const VkPhysicalDeviceFeatures2*>(n)->features.shaderStorageImageExtendedFormats != VK_FALSE;
+        }
+    }
+    if (ci.pEnabledFeatures && hasFeature2) cap49Enabled = false; // invalid/ambiguous chain: fail closed
+    if (r == VK_SUCCESS) InterlockedExchange(&g_graphicsCap49Feature, cap49Enabled ? 1 : 0);
+    LogLine("GRAPHICS-CAP49: sanitized shaderStorageImageExtendedFormats=%u deviceResult=%d", cap49Enabled ? 1u : 0u, (int)r);
 
     for (size_t i = unlinked.size(); i-- > 0;) *unlinked[i].link = unlinked[i].node;
     for (auto& sv : saved) {
